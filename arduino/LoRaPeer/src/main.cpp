@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include <SPI.h>
 #include <LoRa.h>
 #include <Wire.h>
@@ -8,6 +9,11 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include "MessageManager.h"
+#include "ProtocolState.h"
+#include "PeerConfig.h"
+#include "CloudManager.h"
+#include "secrets.h"
 
 // -------------------- PINOUT
 const int LORA_MISO = 19;
@@ -28,6 +34,10 @@ const long LORA_FREQ = 915E6;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
 
 Preferences prefs;
+MessageManager msgManager;
+ProtocolState protocol(5000);
+PeerConfig peerConfig;
+CloudManager cloud;
 
 // -------------------- BLE UUIDs
 #define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -36,41 +46,34 @@ Preferences prefs;
 
 // -------------------- ESTADO GLOBAL
 bool displayReady = false;
-uint8_t NODE_ID = 0;
-uint8_t PEER_ID = 0;
-
 int BLE_clients_connected = 0;
 BLEServer* pServer = NULL;
 BLECharacteristic* pTxCharacteristic = NULL;
-
-// Estructura para mensajes
-struct Message {
-  uint8_t from;
-  String text;
-  unsigned long timestamp;
-  int rssi;
-  bool isBLE;
-};
-
-const int MSG_BUFFER_SIZE = 10;
-Message msgBuffer[MSG_BUFFER_SIZE];
-int msgBufferIdx = 0;
-
-// Latencia
-unsigned long lastMsgSentTime = 0;
 String lastMsgSent = "";
-unsigned long lastAckReceivedTime = 0;
-bool waitingForAck = false;
-
-unsigned long lastHeartbeatTime = 0;
-const unsigned long HEARTBEAT_MS = 5000;
 
 // ==================== FORWARD DECLARATIONS ====================
 void displayStatus();
 void displayMessage(const String &t);
 void sendMessage(uint8_t to, uint8_t from, uint8_t type, const String &msg);
 void sendAck(uint8_t to, uint8_t from);
-void addMessageToBuffer(uint8_t msgFrom, const String &text, unsigned long ts, int rssi, bool isBLE);
+
+// ==================== CLOUD CALLBACK ====================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg = "";
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+  Serial.print("Mensaje recibido desde HiveMQ Cloud: ");
+  Serial.println(msg);
+  
+  // Guardamos el mensaje (asumimos que viene del broker como externo = peer 0 o peer id)
+  // Lo enviamos por LoRa al otro peer
+  sendMessage(peerConfig.getPeerId(), peerConfig.getNodeId(), 0, msg);
+  lastMsgSent = msg;
+  protocol.markMessageSent(millis());
+  msgManager.addMessage(peerConfig.getPeerId(), msg, millis(), 0, false);
+  displayStatus();
+}
 
 // ==================== BLE CALLBACKS ====================
 class MyServerCallbacks: public BLEServerCallbacks {
@@ -97,11 +100,14 @@ class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
         Serial.print("BLE RX: "); Serial.println(msg);
         
         // Enviar por LoRa al peer
-        sendMessage(PEER_ID, NODE_ID, 0, msg);
+        sendMessage(peerConfig.getPeerId(), peerConfig.getNodeId(), 0, msg);
         lastMsgSent = msg;
-        lastMsgSentTime = millis();
-        waitingForAck = true;
-        addMessageToBuffer(NODE_ID, msg, millis(), 0, true);
+        protocol.markMessageSent(millis());
+        msgManager.addMessage(peerConfig.getNodeId(), msg, millis(), 0, true);
+        
+        // Publicar en la nube (HiveMQ)
+        cloud.publishMessage("BLE: " + msg);
+        
         displayStatus();
       }
     }
@@ -139,7 +145,7 @@ void setup() {
   uint8_t storedPeer = prefs.getUChar("peer_id", 0);
 
   displayMessage("Auto-detecting...");
-  Serial.println("--- P2P LoRa + BLE starting ---");
+  Serial.println("--- P2P LoRa + BLE + MQTT starting ---");
 
   unsigned long start = millis();
   bool discoveredPeer = false;
@@ -148,23 +154,10 @@ void setup() {
   while (millis() - start < 5000) {
     if (Serial.available()) {
       String s = Serial.readStringUntil('\n');
-      s.trim();
-      if (s.length() && s.indexOf("node=") >= 0) {
-        int nIndex = s.indexOf("node=");
-        int pIndex = s.indexOf("peer=");
-        if (nIndex >= 0) {
-          String nval = s.substring(nIndex + 5);
-          if (nval.indexOf(' ')>0) nval = nval.substring(0, nval.indexOf(' '));
-          NODE_ID = (uint8_t) nval.toInt();
-        }
-        if (pIndex >= 0) {
-          String pval = s.substring(pIndex + 5);
-          if (pval.indexOf(' ')>0) pval = pval.substring(0, pval.indexOf(' '));
-          PEER_ID = (uint8_t) pval.toInt();
-        }
-        prefs.putUChar("node_id", NODE_ID);
-        prefs.putUChar("peer_id", PEER_ID);
-        goto ble_init;
+      if (peerConfig.parseSerialCommand(s)) {
+        prefs.putUChar("node_id", peerConfig.getNodeId());
+        prefs.putUChar("peer_id", peerConfig.getPeerId());
+        goto config_done;
       }
     }
     
@@ -184,25 +177,28 @@ void setup() {
   }
 
   if (discoveredPeer) {
-    PEER_ID = detectedPeerID;
-    NODE_ID = (PEER_ID == 1) ? 2 : 1;
-  } else if (storedNode != 0 && storedPeer != 0) {
-    NODE_ID = storedNode;
-    PEER_ID = storedPeer;
+    peerConfig.setFromDiscovery(detectedPeerID);
   } else {
-    NODE_ID = 1;
-    PEER_ID = 2;
+    peerConfig.applyFallback(storedNode, storedPeer);
   }
 
-  prefs.putUChar("node_id", NODE_ID);
-  prefs.putUChar("peer_id", PEER_ID);
+  prefs.putUChar("node_id", peerConfig.getNodeId());
+  prefs.putUChar("peer_id", peerConfig.getPeerId());
 
-  Serial.print("Node ID: "); Serial.println(NODE_ID);
-  Serial.print("Peer ID: "); Serial.println(PEER_ID);
+config_done:
+  Serial.print("Node ID: "); Serial.println(peerConfig.getNodeId());
+  Serial.print("Peer ID: "); Serial.println(peerConfig.getPeerId());
 
-ble_init:
+  String mUser = (peerConfig.getNodeId() == 1) ? HIVEMQ_USER_NODE1 : HIVEMQ_USER_NODE2;
+  String mPass = (peerConfig.getNodeId() == 1) ? HIVEMQ_PASS_NODE1 : HIVEMQ_PASS_NODE2;
+
+  // Iniciar la configuración de HiveMQ Cloud (WiFi + MQTT)
+  cloud.configure(WIFI_SSID, WIFI_PASSWORD, peerConfig.getNodeId(), mUser, mPass);
+  cloud.setCallback(mqttCallback);
+  cloud.begin();
+
   // ==================== INICIALIZAR BLE ====================
-  String deviceName = "LoRA_N" + String(NODE_ID);
+  String deviceName = "LoRA_N" + String(peerConfig.getNodeId());
   BLEDevice::init(deviceName.c_str());
   
   // Configurar poder y MTU
@@ -213,7 +209,6 @@ ble_init:
 
   BLEService *pService = pServer->createService(SERVICE_UUID);
 
-  // Característica TX (notificaciones al teléfono)
   pTxCharacteristic = pService->createCharacteristic(
     CHARACTERISTIC_TX_UUID,
     BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
@@ -221,7 +216,6 @@ ble_init:
   pTxCharacteristic->setAccessPermissions(ESP_GATT_PERM_READ);
   pTxCharacteristic->addDescriptor(new BLE2902());
 
-  // Característica RX (recibir del teléfono)
   BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
     CHARACTERISTIC_RX_UUID,
     BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
@@ -231,7 +225,6 @@ ble_init:
 
   pService->start();
 
-  // Configurar advertising
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SERVICE_UUID);
   pAdvertising->setScanResponse(true);
@@ -239,17 +232,20 @@ ble_init:
   pAdvertising->setMaxPreferred(0x12);
   
   BLEDevice::startAdvertising();
-
-  // Configurar MTU
   BLEDevice::setMTU(185);
 
   Serial.print("BLE initialized: "); Serial.println(deviceName);
-  Serial.println("Waiting for BLE connections...");
+  Serial.println("Waiting for connections...");
   displayStatus();
 }
 
 // ==================== LOOP ====================
 void loop() {
+  unsigned long currentMillis = millis();
+
+  // Manejar reconexión y loop de la nube
+  cloud.loop();
+
   // Recibir LoRa
   int packetSize = LoRa.parsePacket();
   if (packetSize) {
@@ -260,21 +256,18 @@ void loop() {
     while (LoRa.available()) payload += (char)LoRa.read();
     
     int rssi = LoRa.packetRssi();
-    unsigned long rxTime = millis();
 
-    if (to == NODE_ID) {
+    if (to == peerConfig.getNodeId()) {
       if (type == 1) {
         // ACK
-        lastAckReceivedTime = rxTime;
-        unsigned long latency = rxTime - lastMsgSentTime;
+        unsigned long latency = protocol.markAckReceived(currentMillis);
         Serial.print("ACK in: "); Serial.print(latency); Serial.println("ms");
-        waitingForAck = false;
       } else {
         // Mensaje de datos
         Serial.print("RX LoRa from "); Serial.print(from);
         Serial.print(": "); Serial.println(payload);
         
-        addMessageToBuffer(from, payload, rxTime, rssi, false);
+        msgManager.addMessage(from, payload, currentMillis, rssi, false);
         
         // Enviar por BLE a todos los clientes conectados
         if (BLE_clients_connected > 0 && pTxCharacteristic != NULL) {
@@ -284,21 +277,22 @@ void loop() {
           Serial.print("BLE TX notify: "); Serial.println(bleTx);
         }
         
+        // Reenviar también a la nube en standby
+        cloud.publishMessage("LoRa RX from N" + String(from) + ": " + payload);
+        
         // Responder ACK por LoRa
-        sendAck(from, NODE_ID);
+        sendAck(from, peerConfig.getNodeId());
       }
       displayStatus();
     }
   }
 
   // Heartbeat
-  if (millis() - lastHeartbeatTime > HEARTBEAT_MS && !waitingForAck) {
-    lastHeartbeatTime = millis();
+  if (protocol.shouldSendHeartbeat(currentMillis)) {
     String hb = "HB";
-    sendMessage(PEER_ID, NODE_ID, 0, hb);
+    sendMessage(peerConfig.getPeerId(), peerConfig.getNodeId(), 0, hb);
     lastMsgSent = hb;
-    lastMsgSentTime = millis();
-    waitingForAck = true;
+    protocol.markMessageSent(currentMillis);
   }
 
   delay(10);
@@ -318,15 +312,6 @@ void sendAck(uint8_t to, uint8_t from) {
   sendMessage(to, from, 1, "ACK");
 }
 
-void addMessageToBuffer(uint8_t msgFrom, const String &text, unsigned long ts, int rssi, bool isBLE) {
-  msgBuffer[msgBufferIdx].from = msgFrom;
-  msgBuffer[msgBufferIdx].text = text.substring(0, 20);
-  msgBuffer[msgBufferIdx].timestamp = ts;
-  msgBuffer[msgBufferIdx].rssi = rssi;
-  msgBuffer[msgBufferIdx].isBLE = isBLE;
-  msgBufferIdx = (msgBufferIdx + 1) % MSG_BUFFER_SIZE;
-}
-
 void displayMessage(const String &t) {
   if (!displayReady) return;
   display.clearDisplay();
@@ -343,16 +328,22 @@ void displayStatus() {
   display.setCursor(0, 0);
   
   // Header
-  display.print("N"); display.print(NODE_ID);
-  display.print(" BLE:");
+  display.print("N"); display.print(peerConfig.getNodeId());
+  display.print(" B:");
   if (BLE_clients_connected > 0) {
     display.print(BLE_clients_connected);
   } else {
-    display.print("--");
+    display.print("-");
+  }
+  display.print(" W:");
+  if (cloud.isConnected()) {
+    display.print("1");
+  } else {
+    display.print("0");
   }
   display.print(" ");
-  if (waitingForAck) {
-    display.println("ACK..");
+  if (protocol.isWaitingForAck()) {
+    display.println("ACK");
   } else {
     display.println("ok");
   }
@@ -360,22 +351,24 @@ void displayStatus() {
   display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
   
   // Mostrar últimos 4 mensajes
-  int startIdx = (msgBufferIdx - 4 + MSG_BUFFER_SIZE) % MSG_BUFFER_SIZE;
+  int bufSize = msgManager.getSize();
+  int startIdx = (msgManager.getHeadIndex() - 4 + bufSize) % bufSize;
   int line = 12;
   
   for (int i = 0; i < 4; i++) {
-    int idx = (startIdx + i) % MSG_BUFFER_SIZE;
-    if (msgBuffer[idx].from != 0) {
+    int idx = (startIdx + i) % bufSize;
+    Message m = msgManager.getMessage(idx);
+    if (m.from != 0) {
       display.setCursor(0, line);
-      if (msgBuffer[idx].isBLE) {
+      if (m.isBLE) {
         display.print("B");
       } else {
         display.print("L");
       }
-      display.print((msgBuffer[idx].from == NODE_ID) ? ">" : "<");
-      display.print(msgBuffer[idx].from);
+      display.print((m.from == peerConfig.getNodeId()) ? ">" : "<");
+      display.print(m.from);
       display.print(": ");
-      display.println(msgBuffer[idx].text);
+      display.println(m.text);
       line += 10;
     }
   }
@@ -383,8 +376,10 @@ void displayStatus() {
   display.drawLine(0, 53, 128, 53, SSD1306_WHITE);
   display.setCursor(0, 55);
   display.print("RSSI: ");
-  if (msgBuffer[(msgBufferIdx - 1 + MSG_BUFFER_SIZE) % MSG_BUFFER_SIZE].from != 0) {
-    display.println(msgBuffer[(msgBufferIdx - 1 + MSG_BUFFER_SIZE) % MSG_BUFFER_SIZE].rssi);
+  
+  Message lastM = msgManager.getMessage((msgManager.getHeadIndex() - 1 + bufSize) % bufSize);
+  if (lastM.from != 0) {
+    display.println(lastM.rssi);
   } else {
     display.println("--");
   }

@@ -1,0 +1,14 @@
+# PlatformIO
+.pio/
+.vscode/
+
+# Flutter (si aplica)
+flutter_app/.dart_tool/
+flutter_app/build/
+flutter_app/.pub-cache/
+flutter_app/.pub/
+flutter_app/ios/Pods/
+flutter_app/ios/.symlinks/
+flutter_app/ios/Flutter/Flutter.framework/
+flutter_app/ios/Flutter/Flutter.podspec
+secrets.h
