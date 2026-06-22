@@ -20,6 +20,7 @@
 #include "SecureCrypto.h"
 #include "PairingManager.h"
 #include "ControlCommand.h"
+#include "E2ECrypto.h"
 #include "secrets.h"
 #include <string>
 #include <vector>
@@ -50,6 +51,7 @@ CloudManager cloud;
 HuffmanCodec huffman;
 SecureCrypto secureCrypto;
 PairingManager pairing;
+E2ECrypto e2e;
 
 // Banderas del primer byte del payload LoRa de datos.
 const uint8_t PAYLOAD_RAW = 0;
@@ -285,6 +287,13 @@ config_done:
   cloud.setCallback(mqttCallback);
   cloud.begin();
 
+  // Inicializar cifrado E2E entre placas (X25519 + AES-GCM).
+  if (e2e.begin()) {
+    Serial.println("E2ECrypto listo (X25519 + AES-256-GCM).");
+  } else {
+    Serial.println("ERROR: no se pudo iniciar E2ECrypto.");
+  }
+
   // Inicializar cifrado de produccion (RSA-2048 OAEP) con la clave publica.
   if (secureCrypto.begin(CLOUD_RSA_PUBLIC_KEY)) {
     Serial.println("SecureCrypto listo (RSA-2048 OAEP-SHA256).");
@@ -367,6 +376,20 @@ void loop() {
       String out = secureCrypto.encryptBase64(cmd.substring(4));
       Serial.print("ENC_OUT="); Serial.println(out);
 #ifdef DIAG_LOGS
+    } else if (cmd == "E2ERFC") {
+      // Vector RFC 7748: valida X25519 + HKDF en hardware contra la app.
+      uint8_t aPriv[32] = {0x77,0x07,0x6d,0x0a,0x73,0x18,0xa5,0x7d,0x3c,0x16,
+        0xc1,0x72,0x51,0xb2,0x66,0x45,0xdf,0x4c,0x2f,0x87,0xeb,0xc0,0x99,0x2a,
+        0xb1,0x77,0xfb,0xa5,0x1d,0xb9,0x2c,0x2a};
+      uint8_t bPub[32] = {0xde,0x9e,0xdb,0x7d,0x7b,0x7d,0xc1,0xb4,0xd3,0x5b,
+        0x61,0xc2,0xec,0xe4,0x35,0x37,0x3f,0x83,0x43,0xc8,0x5b,0x78,0x67,0x4d,
+        0xad,0xfc,0x7e,0x14,0x6f,0x88,0x2b,0x4f};
+      uint8_t pub[32]={0}, key[32]={0};
+      bool okP = e2e.publicFromPrivate(aPriv, pub);
+      bool okK = e2e.deriveAesKey(aPriv, bPub, key);
+      Serial.printf("E2E_OK pub=%d key=%d\n", okP, okK);
+      Serial.print("E2E_PUB="); for (int i=0;i<32;i++) Serial.printf("%02x",pub[i]); Serial.println();
+      Serial.print("E2E_KEY="); for (int i=0;i<32;i++) Serial.printf("%02x",key[i]); Serial.println();
     } else if (cmd.startsWith("TESTUI")) {
       // Prueba de pantallas sin telefono/segunda placa.
       String which = cmd.substring(6); which.trim();
