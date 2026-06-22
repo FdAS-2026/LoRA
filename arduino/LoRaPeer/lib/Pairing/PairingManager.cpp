@@ -50,6 +50,15 @@ void PairingManager::unpair() {
 
 PairAction PairingManager::onPairPacket(uint8_t type, uint16_t pairId,
                                         uint8_t fromNode) {
+  // Ya emparejado: si el peer sigue mandando PAIR_REQ (no recibio el ACK),
+  // re-confirmamos para que su ACK perdido se reintente. Idempotente.
+  if (_paired) {
+    if (type == PKT_PAIR_REQ && pairId == _pairId && fromNode == _peerId) {
+      return PAIR_SEND_ACK;
+    }
+    return PAIR_NONE;
+  }
+
   if (!_pairingMode || pairId != _pendingId) {
     return PAIR_NONE;
   }

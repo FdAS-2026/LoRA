@@ -108,6 +108,22 @@ void test_paired_rejects_other_network(void) {
   TEST_ASSERT_FALSE(pm.acceptData(id, 3));
 }
 
+void test_paired_reacks_peer_req(void) {
+  // Si ya esta emparejado y el peer reenvia PAIR_REQ (ACK perdido), re-confirma.
+  PairingManager pm;
+  pm.startPairing("1234");
+  uint16_t id = PairingManager::derivePairId("1234");
+  pm.onPairPacket(PAIR_ACK, id, 2);  // emparejado con N2
+  TEST_ASSERT_TRUE(pm.isPaired());
+  // Llega otro PAIR_REQ del mismo peer: debe responder ACK de nuevo.
+  PairAction action = pm.onPairPacket(PAIR_REQ, id, 2);
+  TEST_ASSERT_EQUAL_INT(PAIR_SEND_ACK, action);
+  TEST_ASSERT_TRUE(pm.isPaired());
+  // Un REQ de otro nodo/red ya emparejado se ignora.
+  TEST_ASSERT_EQUAL_INT(PAIR_NONE, pm.onPairPacket(PAIR_REQ, id, 3));
+  TEST_ASSERT_EQUAL_INT(PAIR_NONE, pm.onPairPacket(PAIR_REQ, id + 9, 2));
+}
+
 void test_unpair_clears_state(void) {
   PairingManager pm;
   pm.startPairing("1234");
@@ -169,6 +185,7 @@ int main(int, char **) {
   RUN_TEST(test_ignore_pair_packet_when_not_pairing);
   RUN_TEST(test_accept_data_when_unpaired);
   RUN_TEST(test_paired_rejects_other_network);
+  RUN_TEST(test_paired_reacks_peer_req);
   RUN_TEST(test_unpair_clears_state);
   RUN_TEST(test_load_state_restores_pairing);
   RUN_TEST(test_parse_pair_command);

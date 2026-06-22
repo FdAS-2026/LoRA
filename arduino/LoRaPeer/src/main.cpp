@@ -11,6 +11,7 @@
 #include <BLE2902.h>
 #include <BLESecurity.h>
 #include <esp_gap_ble_api.h>
+#include <esp_random.h>
 #include "MessageManager.h"
 #include "ProtocolState.h"
 #include "PeerConfig.h"
@@ -408,12 +409,14 @@ void loop() {
     if (type == TYPE_PAIR_REQ || type == TYPE_PAIR_ACK) {
       // Handshake de emparejamiento (se procesa sin filtro de destino).
       DLOGF("[DIAG] RX pair type=%u pairId=%u from=N%u\n", type, pktPairId, from);
+      bool wasPaired = pairing.isPaired();
       PairAction action = pairing.onPairPacket(type, pktPairId, from);
-      if (action != PAIR_NONE) {
+      if (action == PAIR_SEND_ACK) {
+        sendPairPacket(TYPE_PAIR_ACK, from, pairing.pairId());
+      }
+      // Solo notificar/persistir en la transicion inicial, no en cada re-ACK.
+      if (action != PAIR_NONE && !wasPaired) {
         persistPairing();
-        if (action == PAIR_SEND_ACK) {
-          sendPairPacket(TYPE_PAIR_ACK, from, pairing.pairId());
-        }
         Serial.print("Emparejado con N"); Serial.println(from);
         DLOGF("[DIAG] PAIRED peer=N%u pairId=%u\n", from, pairing.pairId());
         if (BLE_clients_connected > 0 && pTxCharacteristic != NULL) {
@@ -454,10 +457,16 @@ void loop() {
   }
 
   // Reemitir PAIR_REQ periodicamente mientras esta en modo emparejamiento.
+  // Intervalo con jitter aleatorio para que dos placas que entran a la vez en
+  // modo emparejamiento no transmitan sincronizadas y colisionen siempre.
   static unsigned long lastPairBeacon = 0;
-  if (pairing.inPairingMode() && currentMillis - lastPairBeacon > 1000) {
+  static unsigned long pairBeaconInterval = 800;
+  if (pairing.inPairingMode() && currentMillis - lastPairBeacon > pairBeaconInterval) {
     lastPairBeacon = currentMillis;
+    pairBeaconInterval = 600 + (esp_random() % 900);  // 600-1500 ms
     sendPairPacket(TYPE_PAIR_REQ, BROADCAST_ADDR, pairing.pendingPairId());
+    DLOGF("[DIAG] TX PAIR_REQ pairId=%u (next %lums)\n",
+          pairing.pendingPairId(), pairBeaconInterval);
   }
 
   // Heartbeat (solo si esta emparejado; evita ruido en redes ajenas)
