@@ -50,29 +50,25 @@ void PairingManager::unpair() {
 
 PairAction PairingManager::onPairPacket(uint8_t type, uint16_t pairId,
                                         uint8_t fromNode) {
-  // Ya emparejado: si el peer sigue mandando PAIR_REQ (no recibio el ACK),
-  // re-confirmamos para que su ACK perdido se reintente. Idempotente.
-  if (_paired) {
-    if (type == PKT_PAIR_REQ && pairId == _pairId && fromNode == _peerId) {
-      return PAIR_SEND_ACK;
-    }
+  // En modo emparejamiento tiene prioridad: completa (incluso re-emparejando
+  // una placa que ya estaba emparejada). Si no se evaluara primero, una placa
+  // ya emparejada quedaria beaconeando para siempre sin poder completar.
+  if (_pairingMode) {
+    if (pairId != _pendingId) return PAIR_NONE;
+    _paired = true;
+    _pairingMode = false;
+    _pairId = pairId;
+    _peerId = fromNode;
+    if (type == PKT_PAIR_REQ) return PAIR_SEND_ACK;   // confirmar al peer
+    if (type == PKT_PAIR_ACK) return PAIR_COMPLETED;
     return PAIR_NONE;
   }
 
-  if (!_pairingMode || pairId != _pendingId) {
-    return PAIR_NONE;
-  }
-
-  _paired = true;
-  _pairingMode = false;
-  _pairId = pairId;
-  _peerId = fromNode;
-
-  if (type == PKT_PAIR_REQ) {
-    return PAIR_SEND_ACK;  // confirmar al peer
-  }
-  if (type == PKT_PAIR_ACK) {
-    return PAIR_COMPLETED;
+  // Ya emparejado y sin re-emparejar: si el peer reenvia PAIR_REQ (no recibio
+  // el ACK), re-confirmamos de forma idempotente para que reintente.
+  if (_paired && type == PKT_PAIR_REQ && pairId == _pairId &&
+      fromNode == _peerId) {
+    return PAIR_SEND_ACK;
   }
   return PAIR_NONE;
 }
