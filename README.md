@@ -99,10 +99,46 @@ Teléfono ---BLE---> Placa1 ---LoRa---> Placa2 ---BLE---> Teléfono
                                        ACK (automático)
 ```
 
+## Compresión Huffman y cifrado (issue #1)
+
+### Compresión Huffman en LoRa
+
+Los mensajes de datos se comprimen con un árbol de Huffman antes de enviarse por
+LoRa, aprovechando mejor el payload limitado del radio. El primer byte del payload
+indica si va comprimido (`1`) o en crudo (`0`); el emisor elige automáticamente la
+opción más chica, así un mensaje corto nunca crece.
+
+- Módulo: `arduino/LoRaPeer/lib/Compression/HuffmanCodec.{h,cpp}` (C++ puro)
+- Buffer autodescriptivo: incluye la tabla de frecuencias, el receptor reconstruye
+  el mismo árbol y decodifica.
+
+### Cifrado clave pública/privada hacia el broker
+
+Todo lo que la placa publica en el broker se cifra con RSA usando la **clave
+pública** `(e, n)` definida en `secrets.h`. Solo quien tenga la **clave privada**
+`(d)` puede descifrarlo. La placa nunca conoce `d`.
+
+- Módulo: `arduino/LoRaPeer/lib/Crypto/RsaCipher.{h,cpp}` (RSA didáctico de 32 bits, C++ puro)
+- El mensaje se cifra byte a byte y se publica como texto hexadecimal.
+- Configurá tu par real en `secrets.h` (`CLOUD_RSA_E`, `CLOUD_RSA_N`) y guardá `d`
+  fuera del dispositivo, en el consumidor del broker.
+
+### Pruebas (TDD)
+
+La lógica pura se prueba sin hardware con un entorno nativo de PlatformIO:
+
+```bash
+cd arduino/LoRaPeer
+pio test -e native
+```
+
+Cubre roundtrip de compresión, casos borde (vacío, símbolo único, bytes altos),
+compresión efectiva, generación de claves RSA, roundtrip de cifrado y que solo la
+clave privada correcta descifra.
+
 ## Próximos pasos (opcional)
 
 - Añadir GPS a las placas para rastreo
 - Integrar base de datos en la nube
-- Implementar encriptación de mensajes
 - Soporte para múltiples nodos LoRa
 

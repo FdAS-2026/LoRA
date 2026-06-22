@@ -13,7 +13,11 @@
 #include "ProtocolState.h"
 #include "PeerConfig.h"
 #include "CloudManager.h"
+#include "HuffmanCodec.h"
+#include "RsaCipher.h"
 #include "secrets.h"
+#include <string>
+#include <vector>
 
 // -------------------- PINOUT
 const int LORA_MISO = 19;
@@ -38,6 +42,11 @@ MessageManager msgManager;
 ProtocolState protocol(5000);
 PeerConfig peerConfig;
 CloudManager cloud;
+HuffmanCodec huffman;
+
+// Banderas del primer byte del payload LoRa de datos.
+const uint8_t PAYLOAD_RAW = 0;
+const uint8_t PAYLOAD_HUFFMAN = 1;
 
 // -------------------- BLE UUIDs
 #define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -56,6 +65,8 @@ void displayStatus();
 void displayMessage(const String &t);
 void sendMessage(uint8_t to, uint8_t from, uint8_t type, const String &msg);
 void sendAck(uint8_t to, uint8_t from);
+void publishEncrypted(const String &msg);
+String decodeLoraPayload(uint8_t type, const std::vector<uint8_t> &raw);
 
 // ==================== CLOUD CALLBACK ====================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
@@ -106,7 +117,7 @@ class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
         msgManager.addMessage(peerConfig.getNodeId(), msg, millis(), 0, true);
         
         // Publicar en la nube (HiveMQ)
-        cloud.publishMessage("BLE: " + msg);
+        publishEncrypted("BLE: " + msg);
         
         displayStatus();
       }
@@ -252,9 +263,10 @@ void loop() {
     uint8_t to = LoRa.read();
     uint8_t from = LoRa.read();
     uint8_t type = LoRa.read();
-    String payload = "";
-    while (LoRa.available()) payload += (char)LoRa.read();
-    
+    std::vector<uint8_t> rawPayload;
+    while (LoRa.available()) rawPayload.push_back((uint8_t)LoRa.read());
+    String payload = decodeLoraPayload(type, rawPayload);
+
     int rssi = LoRa.packetRssi();
 
     if (to == peerConfig.getNodeId()) {
@@ -278,7 +290,7 @@ void loop() {
         }
         
         // Reenviar también a la nube en standby
-        cloud.publishMessage("LoRa RX from N" + String(from) + ": " + payload);
+        publishEncrypted("LoRa RX from N" + String(from) + ": " + payload);
         
         // Responder ACK por LoRa
         sendAck(from, peerConfig.getNodeId());
@@ -304,8 +316,53 @@ void sendMessage(uint8_t to, uint8_t from, uint8_t type, const String &msg) {
   LoRa.write(to);
   LoRa.write(from);
   LoRa.write(type);
-  LoRa.print(msg.substring(0, 50));
+
+  if (type == 0) {
+    // Mensaje de datos: comprimir con Huffman si reduce el tamano.
+    // Asi caben mensajes mas largos en el payload limitado de LoRa.
+    std::string text(msg.c_str());
+    std::vector<uint8_t> comp = huffman.encode(text);
+    if (!comp.empty() && comp.size() < text.size()) {
+      LoRa.write(PAYLOAD_HUFFMAN);
+      LoRa.write(comp.data(), comp.size());
+    } else {
+      LoRa.write(PAYLOAD_RAW);
+      LoRa.write((const uint8_t *)text.data(), text.size());
+    }
+  } else {
+    // ACK y control: texto plano.
+    LoRa.print(msg);
+  }
   LoRa.endPacket();
+}
+
+// Reconstruye el texto de un payload LoRa segun su tipo y bandera de compresion.
+String decodeLoraPayload(uint8_t type, const std::vector<uint8_t> &raw) {
+  if (type != 0 || raw.empty()) {
+    return String(std::string(raw.begin(), raw.end()).c_str());
+  }
+  uint8_t flag = raw[0];
+  std::vector<uint8_t> body(raw.begin() + 1, raw.end());
+  if (flag == PAYLOAD_HUFFMAN) {
+    std::string decoded = huffman.decode(body);
+    return String(decoded.c_str());
+  }
+  return String(std::string(body.begin(), body.end()).c_str());
+}
+
+// Cifra el mensaje con la clave publica RSA y lo publica en el broker como hex.
+// Solo quien tenga la clave privada (d) puede descifrarlo.
+void publishEncrypted(const String &msg) {
+  std::vector<uint8_t> cipher =
+      RsaCipher::encrypt(std::string(msg.c_str()), CLOUD_RSA_E, CLOUD_RSA_N);
+  static const char *H = "0123456789abcdef";
+  String hex;
+  hex.reserve(cipher.size() * 2);
+  for (uint8_t b : cipher) {
+    hex += H[b >> 4];
+    hex += H[b & 0x0F];
+  }
+  cloud.publishMessage(hex);
 }
 
 void sendAck(uint8_t to, uint8_t from) {
