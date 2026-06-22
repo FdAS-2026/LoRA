@@ -148,6 +148,34 @@ El cifrado RSA-2048 usa mbedtls (solo en la placa). Su interoperabilidad se
 verifica del lado de la app contra un vector generado con OpenSSL (mismo esquema
 OAEP-SHA256): lo que cifra la placa, la app lo descifra.
 
+## Enlace y emparejamiento
+
+### Enlazar placa ↔ teléfono (BLE bonding)
+
+El enlace BLE usa **bonding con Secure Connections**: la placa muestra un
+**passkey de 6 dígitos en la OLED** y el teléfono lo ingresa. El enlace queda
+cifrado y autenticado; las características de chat y control exigen un vínculo
+cifrado (`ESP_GATT_PERM_*_ENCRYPTED`), así solo el teléfono enlazado controla la
+placa.
+
+- Para **desenlazar**, el teléfono envía `UNLINK` y la placa borra sus bonds
+  (`esp_ble_remove_bond_device`).
+
+### Emparejar dos placas (LoRa) con PIN
+
+Dos placas se emparejan compartiendo un **PIN** enviado desde la app:
+
+1. El teléfono manda `PAIR:<pin>` por BLE a ambas placas.
+2. Cada una deriva el mismo `pairId` (FNV-1a del PIN) y emite `PAIR_REQ` por LoRa.
+3. Al recibir un `PAIR_REQ`/`PAIR_ACK` con el `pairId` correcto, quedan
+   emparejadas, guardan el nodo del peer en NVS y responden `PAIR_ACK`.
+4. A partir de ahí, **solo aceptan datos del peer con ese `pairId`** (las tramas
+   LoRa llevan el `pairId`), ignorando otras redes en rango. `UNPAIR` deshace el
+   vínculo.
+
+Lógica pura y testeable en `lib/Pairing/` (`PairingManager`, `ControlCommand`),
+cubierta por `pio test -e native`.
+
 ## Próximos pasos (opcional)
 
 - Añadir GPS a las placas para rastreo
