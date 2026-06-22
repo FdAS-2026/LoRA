@@ -65,6 +65,7 @@ uint32_t blePasskey = 0;
 bool showingPasskey = false;
 String pairingPin = "";
 String lastEvent = "";
+bool claimed = false;  // un telefono ya se vinculo como dueno
 
 // Logs detallados solo en build de prueba (-D DIAG_LOGS).
 #ifdef DIAG_LOGS
@@ -176,20 +177,17 @@ void setup() {
   }
 
   loadContacts();
+  claimed = prefs.getBool("claimed", false);
 
   Serial.printf("Identidad: %s id=%s contactos=%d\n",
                 identity.getName().c_str(), hex16(identity.getId()).c_str(),
                 contacts.count());
 
-  // BLE: nombre = identidad; bonding con passkey en OLED.
+  // BLE: nombre = identidad. Caracteristicas SIN cifrado obligatorio para que
+  // la conexion sea robusta (no depende de bonds que se desincronizan). Los
+  // mensajes igual van E2E cifrados de placa a placa por LoRa.
   BLEDevice::init(identity.getName());
   BLEDevice::setPower(ESP_PWR_LVL_P7);
-  BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
-  BLEDevice::setSecurityCallbacks(new SecurityCallbacks());
-  BLESecurity *sec = new BLESecurity();
-  sec->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
-  sec->setCapability(ESP_IO_CAP_OUT);
-  sec->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
 
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
@@ -198,13 +196,11 @@ void setup() {
   pTxCharacteristic = svc->createCharacteristic(
       CHARACTERISTIC_TX_UUID,
       BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ);
-  pTxCharacteristic->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED);
   pTxCharacteristic->addDescriptor(new BLE2902());
 
   BLECharacteristic *ctrl = svc->createCharacteristic(
       CHARACTERISTIC_CTRL_UUID,
       BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
-  ctrl->setAccessPermissions(ESP_GATT_PERM_WRITE_ENCRYPTED);
   ctrl->setCallbacks(new ControlCallbacks());
 
   svc->start();
@@ -429,8 +425,13 @@ void handleControlCommand(const String &line) {
     return;
   }
   if (line == "WHOAMI") {
+    if (!claimed) {
+      claimed = true;
+      prefs.putBool("claimed", true);
+    }
     notifyPhone("ME:" + hex16(identity.getId()) + ":" +
                 String(identity.getName().c_str()));
+    displayStatus();
     return;
   }
 
@@ -467,6 +468,8 @@ void handleControlCommand(const String &line) {
           free(list);
         }
       }
+      claimed = false;
+      prefs.putBool("claimed", false);
       lastEvent = "";  // ya no hay dueño: limpiar pantalla
       Serial.println("Bonds BLE borrados.");
       displayStatus();
@@ -533,7 +536,7 @@ void displayStatus() {
   if (showingPasskey) return;
   if (pairing.inPairingMode()) { displayPairing(); return; }
 
-  bool hasOwner = esp_ble_get_bond_device_num() > 0;
+  bool conn = BLE_clients_connected > 0;
 
   display.clearDisplay();
   display.setTextSize(1);
@@ -542,24 +545,26 @@ void displayStatus() {
   display.print(identity.getName().c_str());
   display.setCursor(0, 12);
   display.print("ID:"); display.print(hex16(identity.getId()));
-  display.print(" BLE:"); display.print(BLE_clients_connected > 0 ? "1" : "-");
+  display.print(" BLE:"); display.print(conn ? "1" : "-");
   display.print(" C:"); display.print(contacts.count());
   display.drawLine(0, 22, 128, 22, SSD1306_WHITE);
 
   display.setCursor(0, 28);
-  if (!hasOwner) {
+  if (!claimed) {
     // Sin telefono dueño: lista para vincular desde la app.
-    display.setTextSize(1);
     display.println("Sin telefono.");
     display.setCursor(0, 40);
     display.println("Vincula desde la");
     display.setCursor(0, 50);
     display.println("app (BLE).");
+  } else if (!conn) {
+    display.println("Vinculado.");
+    display.setCursor(0, 40);
+    display.println("Telefono ausente.");
   } else {
-    // Con dueño: ultimo evento/mensaje.
     String e = lastEvent;
     if (e.length() > 63) e = e.substring(0, 63);
-    display.println(e.length() ? e : String("Conectado."));
+    display.println(e.length() ? e : String("Listo."));
   }
   display.display();
 }
