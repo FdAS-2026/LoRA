@@ -343,6 +343,25 @@ void loop() {
   // Manejar reconexión y loop de la nube
   cloud.loop();
 
+  // Diagnostico por serial: "ENC <texto>" cifra on-device (RSA-2048 OAEP) y
+  // muestra el base64; util para verificar interoperabilidad con la app.
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    if (cmd.startsWith("ENC ")) {
+      String out = secureCrypto.encryptBase64(cmd.substring(4));
+      Serial.print("ENC_OUT="); Serial.println(out);
+    } else if (cmd == "STATUS") {
+      Serial.print("STATUS node="); Serial.print(peerConfig.getNodeId());
+      Serial.print(" paired="); Serial.print(pairing.isPaired());
+      Serial.print(" peer="); Serial.print(pairing.peerId());
+      Serial.print(" pairId="); Serial.println(pairing.pairId());
+    } else if (cmd.length() > 0) {
+      // Reutiliza el parser de control para PAIR/UNPAIR/UNLINK por serial.
+      handleControlCommand(cmd);
+    }
+  }
+
   // Recibir LoRa
   int packetSize = LoRa.parsePacket();
   if (packetSize) {
