@@ -6,52 +6,41 @@
 
 // Resultado de procesar un paquete de pairing entrante.
 enum PairAction {
-  PAIR_NONE,       // nada que hacer
-  PAIR_SEND_ACK,   // emparejado; responder un PAIR_ACK al peer
-  PAIR_COMPLETED   // emparejado tras recibir el ACK
+  PAIR_NONE,       // ignorar
+  PAIR_SEND_ACK,   // guardar contacto y responder PAIR_ACK
+  PAIR_COMPLETED   // emparejamiento completado (recibido el ACK)
 };
 
-// Gestiona el emparejamiento LoRa entre dos placas mediante un PIN compartido.
-// Logica pura (sin Arduino) para poder probarla sin hardware.
+// Gestiona la SESION de emparejamiento entre placas mediante un PIN compartido.
+// El PIN deriva un pairId que autoriza la sesion: solo placas con el mismo PIN
+// se reconocen. El contacto resultante (id, nombre, clave publica) lo guarda el
+// llamador en la ContactBook; aqui solo se decide la accion. Logica pura.
 //
-// Flujo: la app envia el mismo PIN a ambas placas (startPairing). Ambas derivan
-// el mismo pairId y emiten PAIR_REQ. Al recibir un REQ/ACK con el pairId
-// correcto, quedan emparejadas y guardan el nodo del peer. Luego solo aceptan
-// datos del peer con ese pairId (acceptData), ignorando otras redes en rango.
+// Multi-contacto: cada sesion (un PIN) agrega un contacto. Para sumar mas
+// contactos se inicia otra sesion con otro PIN.
 class PairingManager {
 public:
   PairingManager();
 
-  // Deriva un pairId determinista (FNV-1a de 16 bits) desde el PIN. Nunca 0.
+  // pairId determinista (FNV-1a de 16 bits) desde el PIN. Nunca 0.
   static uint16_t derivePairId(const std::string &pin);
 
-  // Restaura el estado guardado (p. ej. desde NVS).
-  void loadState(bool paired, uint16_t pairId, uint8_t peerId);
-
-  // Inicia el modo de emparejamiento con el PIN dado.
   void startPairing(const std::string &pin);
   void cancelPairing();
-  void unpair();
 
-  bool isPaired() const { return _paired; }
   bool inPairingMode() const { return _pairingMode; }
-  uint16_t pairId() const { return _pairId; }
-  uint8_t peerId() const { return _peerId; }
   uint16_t pendingPairId() const { return _pendingId; }
 
-  // Procesa un paquete de pairing (type 2=REQ, 3=ACK) recibido por LoRa.
-  PairAction onPairPacket(uint8_t type, uint16_t pairId, uint8_t fromNode);
-
-  // Decide si aceptar un paquete de datos. Sin emparejar acepta todo; ya
-  // emparejado exige pairId y nodo del peer correctos.
-  bool acceptData(uint16_t pairId, uint8_t fromNode) const;
+  // Procesa un paquete de pairing (type 2=REQ, 3=ACK).
+  // - fromBoardId: id de la placa remota; myBoardId: id propio (se ignora self).
+  // - alreadyContact: si la placa remota ya esta en la agenda (para re-ACK
+  //   idempotente si su ACK se perdio).
+  PairAction onPairPacket(uint8_t type, uint16_t pairId, uint16_t fromBoardId,
+                          uint16_t myBoardId, bool alreadyContact);
 
 private:
-  bool _paired;
   bool _pairingMode;
-  uint16_t _pairId;
   uint16_t _pendingId;
-  uint8_t _peerId;
 };
 
 #endif

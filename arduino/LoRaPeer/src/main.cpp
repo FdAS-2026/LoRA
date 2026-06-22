@@ -12,31 +12,24 @@
 #include <BLESecurity.h>
 #include <esp_gap_ble_api.h>
 #include <esp_random.h>
-#include "MessageManager.h"
-#include "ProtocolState.h"
-#include "PeerConfig.h"
-#include "CloudManager.h"
-#include "HuffmanCodec.h"
-#include "SecureCrypto.h"
+#include "Identity.h"
+#include "ContactBook.h"
+#include "E2ECrypto.h"
 #include "PairingManager.h"
 #include "ControlCommand.h"
-#include "E2ECrypto.h"
-#include "secrets.h"
 #include <string>
 #include <vector>
 
+// Mensajeria E2E sobre LoRa, sin internet (tipo WhatsApp offline):
+//   - 1 telefono <-> 1 placa (su identidad; enlace BLE con passkey).
+//   - la placa se empareja con varias placas-contacto (intercambio de claves).
+//   - cada mensaje se cifra con la clave del contacto destino (X25519+AES-GCM):
+//     solo ese contacto lo descifra.
+
 // -------------------- PINOUT
-const int LORA_MISO = 19;
-const int LORA_SS   = 18;
-const int LORA_SCK  = 5;
-const int LORA_MOSI = 27;
-const int LORA_RST  = 14;
-const int LORA_IRQ  = 26;
-
-const int OLED_SCL = 15;
-const int OLED_SDA = 4;
-const int OLED_RST = 16;
-
+const int LORA_MISO = 19, LORA_SS = 18, LORA_SCK = 5, LORA_MOSI = 27;
+const int LORA_RST = 14, LORA_IRQ = 26;
+const int OLED_SCL = 15, OLED_SDA = 4, OLED_RST = 16;
 const long LORA_FREQ = 915E6;
 
 #define SCREEN_WIDTH 128
@@ -44,153 +37,99 @@ const long LORA_FREQ = 915E6;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
 
 Preferences prefs;
-MessageManager msgManager;
-ProtocolState protocol(5000);
-PeerConfig peerConfig;
-CloudManager cloud;
-HuffmanCodec huffman;
-SecureCrypto secureCrypto;
-PairingManager pairing;
+Identity identity;
+ContactBook contacts;
 E2ECrypto e2e;
+PairingManager pairing;
 
-// Banderas del primer byte del payload LoRa de datos.
-const uint8_t PAYLOAD_RAW = 0;
-const uint8_t PAYLOAD_HUFFMAN = 1;
+uint8_t myPriv[32], myPub[32];
+bool e2eReady = false;
 
-// Tipos de trama LoRa.
+// Tipos y direcciones de trama LoRa: [dstHi][dstLo][srcHi][srcLo][type][payload]
 const uint8_t TYPE_DATA = 0;
-const uint8_t TYPE_ACK = 1;
 const uint8_t TYPE_PAIR_REQ = 2;
 const uint8_t TYPE_PAIR_ACK = 3;
-const uint8_t BROADCAST_ADDR = 0xFF;
+const uint16_t BROADCAST = 0xFFFF;
 
-// -------------------- BLE UUIDs
+// -------------------- BLE
 #define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
-#define CHARACTERISTIC_RX_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
-#define CHARACTERISTIC_TX_UUID "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
-#define CHARACTERISTIC_CTRL_UUID "6E400004-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_RX_UUID "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  // (no usado, reservado)
+#define CHARACTERISTIC_TX_UUID "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  // notificaciones -> telefono
+#define CHARACTERISTIC_CTRL_UUID "6E400004-B5A3-F393-E0A9-E50E24DCCA9E" // comandos <- telefono
 
-// -------------------- ESTADO GLOBAL
 bool displayReady = false;
 int BLE_clients_connected = 0;
-BLEServer* pServer = NULL;
-BLECharacteristic* pTxCharacteristic = NULL;
-String lastMsgSent = "";
-uint32_t blePasskey = 0;        // passkey BLE a mostrar en la OLED
+BLEServer *pServer = nullptr;
+BLECharacteristic *pTxCharacteristic = nullptr;
+uint32_t blePasskey = 0;
 bool showingPasskey = false;
-String pairingPin = "";         // PIN de emparejamiento de placas (para la OLED)
+String pairingPin = "";
+String lastEvent = "";
 
-// Logs detallados solo en build de prueba (flag -D DIAG_LOGS).
+// Logs detallados solo en build de prueba (-D DIAG_LOGS).
 #ifdef DIAG_LOGS
-  #define DLOG(x)    Serial.println(x)
   #define DLOGF(...) Serial.printf(__VA_ARGS__)
 #else
-  #define DLOG(x)
   #define DLOGF(...)
 #endif
 
 // ==================== FORWARD DECLARATIONS ====================
 void displayStatus();
-void displayMessage(const String &t);
 void displayPasskey(uint32_t passkey);
 void displayPairing();
-void displayPaired(uint8_t peer);
-void sendMessage(uint8_t to, uint8_t from, uint8_t type, uint16_t pairId, const String &msg);
-void sendAck(uint8_t to, uint8_t from);
-void sendPairPacket(uint8_t type, uint8_t to, uint16_t pairId);
-void publishEncrypted(const String &msg);
-String decodeLoraPayload(uint8_t type, const std::vector<uint8_t> &raw);
+void notifyPhone(const String &s);
+void sendFrame(uint16_t dst, uint8_t type, const uint8_t *payload, size_t len);
+void sendPairPacket(uint8_t type, uint16_t dst);
 void handleControlCommand(const String &line);
-void persistPairing();
+void sendToContact(uint16_t dstId, const String &text);
+void saveContacts();
+void loadContacts();
 
-// ==================== CLOUD CALLBACK ====================
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String msg = "";
-  for (unsigned int i = 0; i < length; i++) {
-    msg += (char)payload[i];
-  }
-  Serial.print("Mensaje recibido desde HiveMQ Cloud: ");
-  Serial.println(msg);
-  
-  // Guardamos el mensaje (asumimos que viene del broker como externo = peer 0 o peer id)
-  // Lo enviamos por LoRa al otro peer
-  sendMessage(peerConfig.getPeerId(), peerConfig.getNodeId(), TYPE_DATA, pairing.pairId(), msg);
-  lastMsgSent = msg;
-  protocol.markMessageSent(millis());
-  msgManager.addMessage(peerConfig.getPeerId(), msg, millis(), 0, false);
-  displayStatus();
+// ==================== HELPERS ====================
+static String hex16(uint16_t v) {
+  char b[5];
+  snprintf(b, sizeof(b), "%04X", v);
+  return String(b);
 }
 
 // ==================== BLE CALLBACKS ====================
-class MyServerCallbacks: public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) {
+class ServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *) {
     BLE_clients_connected++;
-    Serial.print("BLE: Cliente conectado. Total: "); Serial.println(BLE_clients_connected);
-    DLOG("[DIAG] BLE onConnect");
+    DLOGF("[DIAG] BLE onConnect\n");
     displayStatus();
-  };
-
-  void onDisconnect(BLEServer* pServer) {
+  }
+  void onDisconnect(BLEServer *s) {
     if (BLE_clients_connected > 0) BLE_clients_connected--;
-    Serial.print("BLE: Cliente desconectado. Total: "); Serial.println(BLE_clients_connected);
+    s->getAdvertising()->start();
     displayStatus();
   }
 };
 
-class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *pCharacteristic) {
-    String rxValue = pCharacteristic->getValue().c_str();
-    if (rxValue.length() > 0) {
-      String msg = rxValue;
-      msg.trim();
-      if (msg.length() > 0) {
-        Serial.print("BLE RX: "); Serial.println(msg);
-
-        // Enviar por LoRa al peer (con el pairId de la red emparejada)
-        sendMessage(peerConfig.getPeerId(), peerConfig.getNodeId(), TYPE_DATA,
-                    pairing.pairId(), msg);
-        lastMsgSent = msg;
-        protocol.markMessageSent(millis());
-        msgManager.addMessage(peerConfig.getNodeId(), msg, millis(), 0, true);
-
-        // Publicar en la nube (HiveMQ)
-        publishEncrypted("BLE: " + msg);
-
-        displayStatus();
-      }
+class ControlCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *c) {
+    String v = c->getValue().c_str();
+    v.trim();
+    if (v.length() > 0) {
+      DLOGF("[DIAG] CTRL: %s\n", v.c_str());
+      handleControlCommand(v);
     }
   }
 };
 
-// Recibe comandos de control (PAIR/UNPAIR/UNLINK/STATUS) por una caracteristica
-// dedicada, separada del chat.
-class ControlCharacteristicCallbacks: public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic *pCharacteristic) {
-    String value = pCharacteristic->getValue().c_str();
-    value.trim();
-    if (value.length() > 0) {
-      Serial.print("BLE CTRL: "); Serial.println(value);
-      handleControlCommand(value);
-    }
-  }
-};
-
-// Muestra el passkey de bonding en la OLED y notifica el estado de la auth.
-class MySecurityCallbacks: public BLESecurityCallbacks {
+class SecurityCallbacks : public BLESecurityCallbacks {
   uint32_t onPassKeyRequest() { return 0; }
   void onPassKeyNotify(uint32_t pass_key) {
     blePasskey = pass_key;
     showingPasskey = true;
-    Serial.print("BLE passkey: "); Serial.println(pass_key);
-    DLOGF("[DIAG] BLE passkey notify=%06u -> OLED\n", pass_key);
+    DLOGF("[DIAG] passkey=%06u\n", pass_key);
     displayPasskey(pass_key);
   }
   bool onConfirmPIN(uint32_t) { return true; }
   bool onSecurityRequest() { return true; }
   void onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) {
     showingPasskey = false;
-    Serial.print("BLE bonding ");
-    Serial.println(cmpl.success ? "exitoso" : "fallido");
+    Serial.println(cmpl.success ? "BLE bonding OK" : "BLE bonding fallo");
     displayStatus();
   }
 };
@@ -200,387 +139,331 @@ void setup() {
   Serial.begin(115200);
   delay(100);
 
-  // OLED
   Wire.begin(OLED_SDA, OLED_SCL);
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    displayReady = false;
-  } else {
-    displayReady = true;
-  }
+  displayReady = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.clearDisplay();
-  display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  // LoRa
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
   LoRa.setPins(LORA_SS, LORA_RST, LORA_IRQ);
   if (!LoRa.begin(LORA_FREQ)) {
     Serial.println("LoRa init failed.");
-    displayMessage("LoRa FAILED");
-    while (1) { delay(2000); }
+    if (displayReady) { display.setCursor(0,0); display.setTextSize(2); display.println("LoRa FAIL"); display.display(); }
+    while (1) delay(2000);
   }
 
-  // Auto-discovery LoRa
   prefs.begin("lora", false);
-  uint8_t storedNode = prefs.getUChar("node_id", 0);
-  uint8_t storedPeer = prefs.getUChar("peer_id", 0);
 
-  displayMessage("Auto-detecting...");
-  Serial.println("--- P2P LoRa + BLE + MQTT starting ---");
+  // Identidad: boardId unico (se genera una vez) + nombre.
+  uint16_t bid = prefs.getUShort("bid", 0);
+  if (bid == 0) {
+    bid = (uint16_t)(esp_random() & 0xFFFF);
+    if (bid == 0 || bid == 0xFFFF) bid = 0x1001;  // evitar 0 y broadcast
+    prefs.putUShort("bid", bid);
+  }
+  String name = prefs.getString("name", "");
+  identity.set(bid, std::string(name.c_str()));
 
-  unsigned long start = millis();
-  bool discoveredPeer = false;
-  uint8_t detectedPeerID = 0;
-  
-  while (millis() - start < 5000) {
-    if (Serial.available()) {
-      String s = Serial.readStringUntil('\n');
-      if (peerConfig.parseSerialCommand(s)) {
-        prefs.putUChar("node_id", peerConfig.getNodeId());
-        prefs.putUChar("peer_id", peerConfig.getPeerId());
-        goto config_done;
-      }
+  // Par de claves X25519 (se genera una vez y persiste).
+  e2eReady = e2e.begin();
+  size_t got = prefs.getBytes("e2e_priv", myPriv, 32);
+  if (got != 32) {
+    if (e2e.generateKeyPair(myPriv, myPub)) {
+      prefs.putBytes("e2e_priv", myPriv, 32);
     }
-    
-    int packetSize = LoRa.parsePacket();
-    if (packetSize) {
-      uint8_t to = LoRa.read();
-      uint8_t from = LoRa.read();
-      LoRa.read();
-      String payload = "";
-      while (LoRa.available()) payload += (char)LoRa.read();
-      
-      detectedPeerID = from;
-      discoveredPeer = true;
-      break;
-    }
-    delay(50);
-  }
-
-  if (discoveredPeer) {
-    peerConfig.setFromDiscovery(detectedPeerID);
   } else {
-    peerConfig.applyFallback(storedNode, storedPeer);
+    e2e.publicFromPrivate(myPriv, myPub);
   }
 
-  prefs.putUChar("node_id", peerConfig.getNodeId());
-  prefs.putUChar("peer_id", peerConfig.getPeerId());
+  loadContacts();
 
-config_done:
-  Serial.print("Node ID: "); Serial.println(peerConfig.getNodeId());
-  Serial.print("Peer ID: "); Serial.println(peerConfig.getPeerId());
+  Serial.printf("Identidad: %s id=%s contactos=%d\n",
+                identity.getName().c_str(), hex16(identity.getId()).c_str(),
+                contacts.count());
 
-  // Restaurar el emparejamiento de placas guardado.
-  pairing.loadState(prefs.getBool("paired", false),
-                    prefs.getUShort("pair_id", 0),
-                    prefs.getUChar("pair_peer", 0));
-  if (pairing.isPaired()) {
-    Serial.print("Emparejado con N"); Serial.print(pairing.peerId());
-    Serial.print(" (pairId="); Serial.print(pairing.pairId()); Serial.println(")");
-  }
-
-  String mUser = (peerConfig.getNodeId() == 1) ? HIVEMQ_USER_NODE1 : HIVEMQ_USER_NODE2;
-  String mPass = (peerConfig.getNodeId() == 1) ? HIVEMQ_PASS_NODE1 : HIVEMQ_PASS_NODE2;
-
-  // Iniciar la configuración de HiveMQ Cloud (WiFi + MQTT)
-  cloud.configure(WIFI_SSID, WIFI_PASSWORD, peerConfig.getNodeId(), mUser, mPass);
-  cloud.setCallback(mqttCallback);
-  cloud.begin();
-
-  // Inicializar cifrado E2E entre placas (X25519 + AES-GCM).
-  if (e2e.begin()) {
-    Serial.println("E2ECrypto listo (X25519 + AES-256-GCM).");
-  } else {
-    Serial.println("ERROR: no se pudo iniciar E2ECrypto.");
-  }
-
-  // Inicializar cifrado de produccion (RSA-2048 OAEP) con la clave publica.
-  if (secureCrypto.begin(CLOUD_RSA_PUBLIC_KEY)) {
-    Serial.println("SecureCrypto listo (RSA-2048 OAEP-SHA256).");
-  } else {
-    Serial.println("ERROR: no se pudo cargar la clave publica RSA.");
-  }
-
-  // ==================== INICIALIZAR BLE ====================
-  String deviceName = "LoRA_N" + String(peerConfig.getNodeId());
-  BLEDevice::init(deviceName.c_str());
-
-  // Configurar poder y MTU
+  // BLE: nombre = identidad; bonding con passkey en OLED.
+  BLEDevice::init(identity.getName());
   BLEDevice::setPower(ESP_PWR_LVL_P7);
-
-  // Seguridad: bonding con passkey mostrado en la OLED (Secure Connections).
-  // El telefono ingresa el PIN de 6 digitos => enlace cifrado y autenticado.
   BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
-  BLEDevice::setSecurityCallbacks(new MySecurityCallbacks());
-  BLESecurity *pSecurity = new BLESecurity();
-  pSecurity->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
-  pSecurity->setCapability(ESP_IO_CAP_OUT);  // solo salida => muestra passkey
-  pSecurity->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+  BLEDevice::setSecurityCallbacks(new SecurityCallbacks());
+  BLESecurity *sec = new BLESecurity();
+  sec->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
+  sec->setCapability(ESP_IO_CAP_OUT);
+  sec->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
 
   pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
+  pServer->setCallbacks(new ServerCallbacks());
+  BLEService *svc = pServer->createService(SERVICE_UUID);
 
-  BLEService *pService = pServer->createService(SERVICE_UUID);
-
-  pTxCharacteristic = pService->createCharacteristic(
-    CHARACTERISTIC_TX_UUID,
-    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
-  );
+  pTxCharacteristic = svc->createCharacteristic(
+      CHARACTERISTIC_TX_UUID,
+      BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ);
   pTxCharacteristic->setAccessPermissions(ESP_GATT_PERM_READ_ENCRYPTED);
   pTxCharacteristic->addDescriptor(new BLE2902());
 
-  BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
-    CHARACTERISTIC_RX_UUID,
-    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
-  );
-  pRxCharacteristic->setAccessPermissions(ESP_GATT_PERM_WRITE_ENCRYPTED);
-  pRxCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
+  BLECharacteristic *ctrl = svc->createCharacteristic(
+      CHARACTERISTIC_CTRL_UUID,
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  ctrl->setAccessPermissions(ESP_GATT_PERM_WRITE_ENCRYPTED);
+  ctrl->setCallbacks(new ControlCallbacks());
 
-  // Caracteristica de control (enlace/emparejamiento), tambien cifrada.
-  BLECharacteristic *pCtrlCharacteristic = pService->createCharacteristic(
-    CHARACTERISTIC_CTRL_UUID,
-    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
-  );
-  pCtrlCharacteristic->setAccessPermissions(ESP_GATT_PERM_WRITE_ENCRYPTED);
-  pCtrlCharacteristic->setCallbacks(new ControlCharacteristicCallbacks());
-
-  pService->start();
-
-  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->setScanResponse(true);
-  pAdvertising->setMinPreferred(0x06);
-  pAdvertising->setMaxPreferred(0x12);
-  
+  svc->start();
+  BLEAdvertising *adv = BLEDevice::getAdvertising();
+  adv->addServiceUUID(SERVICE_UUID);
+  adv->setScanResponse(true);
   BLEDevice::startAdvertising();
   BLEDevice::setMTU(185);
 
-  Serial.print("BLE initialized: "); Serial.println(deviceName);
-  Serial.println("Waiting for connections...");
+  Serial.println(e2eReady ? "E2ECrypto listo." : "E2ECrypto FALLO.");
   displayStatus();
 }
 
 // ==================== LOOP ====================
 void loop() {
-  unsigned long currentMillis = millis();
-
-  // Manejar reconexión y loop de la nube
-  cloud.loop();
-
-  // Diagnostico por serial: "ENC <texto>" cifra on-device (RSA-2048 OAEP) y
-  // muestra el base64; util para verificar interoperabilidad con la app.
+  // Diagnostico / control por serial (acceso fisico).
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
-    if (cmd.startsWith("ENC ")) {
-      String out = secureCrypto.encryptBase64(cmd.substring(4));
-      Serial.print("ENC_OUT="); Serial.println(out);
-#ifdef DIAG_LOGS
-    } else if (cmd == "E2ERFC") {
-      // Vector RFC 7748: valida X25519 + HKDF en hardware contra la app.
-      uint8_t aPriv[32] = {0x77,0x07,0x6d,0x0a,0x73,0x18,0xa5,0x7d,0x3c,0x16,
-        0xc1,0x72,0x51,0xb2,0x66,0x45,0xdf,0x4c,0x2f,0x87,0xeb,0xc0,0x99,0x2a,
-        0xb1,0x77,0xfb,0xa5,0x1d,0xb9,0x2c,0x2a};
-      uint8_t bPub[32] = {0xde,0x9e,0xdb,0x7d,0x7b,0x7d,0xc1,0xb4,0xd3,0x5b,
-        0x61,0xc2,0xec,0xe4,0x35,0x37,0x3f,0x83,0x43,0xc8,0x5b,0x78,0x67,0x4d,
-        0xad,0xfc,0x7e,0x14,0x6f,0x88,0x2b,0x4f};
-      uint8_t pub[32]={0}, key[32]={0};
-      bool okP = e2e.publicFromPrivate(aPriv, pub);
-      bool okK = e2e.deriveAesKey(aPriv, bPub, key);
-      Serial.printf("E2E_OK pub=%d key=%d\n", okP, okK);
-      Serial.print("E2E_PUB="); for (int i=0;i<32;i++) Serial.printf("%02x",pub[i]); Serial.println();
-      Serial.print("E2E_KEY="); for (int i=0;i<32;i++) Serial.printf("%02x",key[i]); Serial.println();
-    } else if (cmd.startsWith("TESTUI")) {
-      // Prueba de pantallas sin telefono/segunda placa.
-      String which = cmd.substring(6); which.trim();
-      if (which == "passkey") {
-        showingPasskey = true; displayPasskey(123456);
-        Serial.println("[DIAG] OLED -> passkey 123456");
-      } else if (which == "paired") {
-        displayPaired(2);
-        Serial.println("[DIAG] OLED -> emparejado N2");
-      } else {  // pairing
-        pairingPin = "1234"; pairing.startPairing("1234"); displayPairing();
-        Serial.println("[DIAG] OLED -> emparejando PIN 1234");
-      }
-#endif
-    } else if (cmd == "STATUS") {
-      Serial.print("STATUS node="); Serial.print(peerConfig.getNodeId());
-      Serial.print(" paired="); Serial.print(pairing.isPaired());
-      Serial.print(" peer="); Serial.print(pairing.peerId());
-      Serial.print(" pairId="); Serial.println(pairing.pairId());
-    } else if (cmd.length() > 0) {
-      // Reutiliza el parser de control para PAIR/UNPAIR/UNLINK por serial.
-      handleControlCommand(cmd);
-    }
+    if (cmd.length() > 0) handleControlCommand(cmd);
   }
 
   // Recibir LoRa
-  int packetSize = LoRa.parsePacket();
-  if (packetSize) {
-    uint8_t to = LoRa.read();
-    uint8_t from = LoRa.read();
+  int pkt = LoRa.parsePacket();
+  if (pkt >= 5) {
+    uint16_t dst = ((uint16_t)LoRa.read() << 8) | LoRa.read();
+    uint16_t src = ((uint16_t)LoRa.read() << 8) | LoRa.read();
     uint8_t type = LoRa.read();
-    uint8_t pidHi = LoRa.read();
-    uint8_t pidLo = LoRa.read();
-    uint16_t pktPairId = ((uint16_t)pidHi << 8) | pidLo;
-    std::vector<uint8_t> rawPayload;
-    while (LoRa.available()) rawPayload.push_back((uint8_t)LoRa.read());
-
+    std::vector<uint8_t> payload;
+    while (LoRa.available()) payload.push_back((uint8_t)LoRa.read());
     int rssi = LoRa.packetRssi();
 
+    bool forMe = (dst == identity.getId());
+    bool bcast = (dst == BROADCAST);
+
     if (type == TYPE_PAIR_REQ || type == TYPE_PAIR_ACK) {
-      // Handshake de emparejamiento (se procesa sin filtro de destino).
-      DLOGF("[DIAG] RX pair type=%u pairId=%u from=N%u\n", type, pktPairId, from);
-      bool wasPaired = pairing.isPaired();
-      PairAction action = pairing.onPairPacket(type, pktPairId, from);
-      if (action == PAIR_SEND_ACK) {
-        sendPairPacket(TYPE_PAIR_ACK, from, pairing.pairId());
-      }
-      // Solo notificar/persistir en la transicion inicial, no en cada re-ACK.
-      if (action != PAIR_NONE && !wasPaired) {
-        persistPairing();
-        Serial.print("Emparejado con N"); Serial.println(from);
-        DLOGF("[DIAG] PAIRED peer=N%u pairId=%u\n", from, pairing.pairId());
-        if (BLE_clients_connected > 0 && pTxCharacteristic != NULL) {
-          String n = "PAIRED:N" + String(from);
-          pTxCharacteristic->setValue((uint8_t *)n.c_str(), n.length());
-          pTxCharacteristic->notify();
+      // payload: [pairId(2)][pubkey(32)][nameLen(1)][name...]
+      if (payload.size() >= 35) {
+        uint16_t pairId = ((uint16_t)payload[0] << 8) | payload[1];
+        uint8_t theirPub[32];
+        memcpy(theirPub, &payload[2], 32);
+        uint8_t nameLen = payload[34];
+        std::string theirName;
+        if (payload.size() >= 35u + nameLen) {
+          theirName.assign((char *)&payload[35], nameLen);
         }
-        displayPaired(from);
-      }
-    } else if (to == peerConfig.getNodeId() && pairing.acceptData(pktPairId, from)) {
-      String payload = decodeLoraPayload(type, rawPayload);
-      if (type == TYPE_ACK) {
-        unsigned long latency = protocol.markAckReceived(currentMillis);
-        Serial.print("ACK in: "); Serial.print(latency); Serial.println("ms");
-      } else {
-        // Mensaje de datos
-        Serial.print("RX LoRa from "); Serial.print(from);
-        Serial.print(": "); Serial.println(payload);
-
-        msgManager.addMessage(from, payload, currentMillis, rssi, false);
-
-        // Enviar por BLE a todos los clientes conectados
-        if (BLE_clients_connected > 0 && pTxCharacteristic != NULL) {
-          String bleTx = String(from) + ": " + payload;
-          pTxCharacteristic->setValue((uint8_t *)bleTx.c_str(), bleTx.length());
-          pTxCharacteristic->notify();
-          Serial.print("BLE TX notify: "); Serial.println(bleTx);
+        bool known = contacts.find(src) != nullptr;
+        DLOGF("[DIAG] RX pair t=%u src=%s pid=%u known=%d\n", type,
+              hex16(src).c_str(), pairId, known);
+        PairAction act = pairing.onPairPacket(type, pairId, src,
+                                              identity.getId(), known);
+        if (act != PAIR_NONE) {
+          contacts.addOrUpdate(src, theirName, theirPub);
+          saveContacts();
+          if (act == PAIR_SEND_ACK) sendPairPacket(TYPE_PAIR_ACK, src);
+          lastEvent = "Pair: " + String(theirName.c_str());
+          notifyPhone("PAIRED:" + hex16(src) + ":" + String(theirName.c_str()));
+          Serial.printf("Emparejado con %s (%s)\n", theirName.c_str(),
+                        hex16(src).c_str());
+          displayStatus();
         }
-
-        // Reenviar también a la nube en standby
-        publishEncrypted("LoRa RX from N" + String(from) + ": " + payload);
-
-        // Responder ACK por LoRa
-        sendAck(from, peerConfig.getNodeId());
       }
-      displayStatus();
+    } else if (type == TYPE_DATA && forMe) {
+      // Mensaje E2E de un contacto: descifrar con la clave compartida.
+      const Contact *c = contacts.find(src);
+      if (c && c->hasKey && e2eReady) {
+        uint8_t aesKey[32];
+        if (e2e.deriveAesKey(myPriv, c->pubKey, aesKey)) {
+          uint8_t clear[256];
+          int n = e2e.decrypt(aesKey, payload.data(), payload.size(), clear,
+                              sizeof(clear));
+          if (n >= 0) {
+            String text((char *)clear, n);
+            lastEvent = String(c->name.c_str()) + ": " + text;
+            notifyPhone("MSG:" + hex16(src) + ":" + text);
+            Serial.printf("MSG de %s: %s\n", c->name.c_str(), text.c_str());
+            displayStatus();
+          } else {
+            DLOGF("[DIAG] fallo descifrado de %s\n", hex16(src).c_str());
+          }
+        }
+      }
     }
+    (void)bcast; (void)rssi;
   }
 
-  // Reemitir PAIR_REQ periodicamente mientras esta en modo emparejamiento.
-  // Intervalo con jitter aleatorio para que dos placas que entran a la vez en
-  // modo emparejamiento no transmitan sincronizadas y colisionen siempre.
-  static unsigned long lastPairBeacon = 0;
-  static unsigned long pairBeaconInterval = 800;
-  if (pairing.inPairingMode() && currentMillis - lastPairBeacon > pairBeaconInterval) {
-    lastPairBeacon = currentMillis;
-    pairBeaconInterval = 600 + (esp_random() % 900);  // 600-1500 ms
-    sendPairPacket(TYPE_PAIR_REQ, BROADCAST_ADDR, pairing.pendingPairId());
-    DLOGF("[DIAG] TX PAIR_REQ pairId=%u (next %lums)\n",
-          pairing.pendingPairId(), pairBeaconInterval);
-  }
-
-  // Heartbeat (solo si esta emparejado; evita ruido en redes ajenas)
-  if (protocol.shouldSendHeartbeat(currentMillis)) {
-    String hb = "HB";
-    sendMessage(peerConfig.getPeerId(), peerConfig.getNodeId(), TYPE_DATA,
-                pairing.pairId(), hb);
-    lastMsgSent = hb;
-    protocol.markMessageSent(currentMillis);
+  // Beacon de pairing con jitter (evita colisiones sincronizadas).
+  static unsigned long lastBeacon = 0;
+  static unsigned long beaconIv = 800;
+  unsigned long now = millis();
+  if (pairing.inPairingMode() && now - lastBeacon > beaconIv) {
+    lastBeacon = now;
+    beaconIv = 600 + (esp_random() % 900);
+    sendPairPacket(TYPE_PAIR_REQ, BROADCAST);
+    DLOGF("[DIAG] TX PAIR_REQ pid=%u\n", pairing.pendingPairId());
   }
 
   delay(10);
 }
 
-// ==================== FUNCIONES ====================
-// Trama LoRa: [to][from][type][pairId_hi][pairId_lo][payload...]
-void sendMessage(uint8_t to, uint8_t from, uint8_t type, uint16_t pairId, const String &msg) {
+// ==================== ENVIO LoRa ====================
+void sendFrame(uint16_t dst, uint8_t type, const uint8_t *payload, size_t len) {
   LoRa.beginPacket();
-  LoRa.write(to);
-  LoRa.write(from);
+  LoRa.write((dst >> 8) & 0xFF);
+  LoRa.write(dst & 0xFF);
+  LoRa.write((identity.getId() >> 8) & 0xFF);
+  LoRa.write(identity.getId() & 0xFF);
   LoRa.write(type);
-  LoRa.write((pairId >> 8) & 0xFF);
-  LoRa.write(pairId & 0xFF);
+  if (payload && len) LoRa.write(payload, len);
+  LoRa.endPacket();
+}
 
-  if (type == TYPE_DATA) {
-    // Mensaje de datos: comprimir con Huffman si reduce el tamano.
-    // Asi caben mensajes mas largos en el payload limitado de LoRa.
-    std::string text(msg.c_str());
-    std::vector<uint8_t> comp = huffman.encode(text);
-    if (!comp.empty() && comp.size() < text.size()) {
-      LoRa.write(PAYLOAD_HUFFMAN);
-      LoRa.write(comp.data(), comp.size());
-    } else {
-      LoRa.write(PAYLOAD_RAW);
-      LoRa.write((const uint8_t *)text.data(), text.size());
-    }
-  } else {
-    // ACK y control: texto plano.
-    LoRa.print(msg);
+// PAIR_REQ/ACK: comparte pairId + clave publica + nombre.
+void sendPairPacket(uint8_t type, uint16_t dst) {
+  std::vector<uint8_t> p;
+  uint16_t pid = pairing.pendingPairId();
+  p.push_back((pid >> 8) & 0xFF);
+  p.push_back(pid & 0xFF);
+  for (int i = 0; i < 32; i++) p.push_back(myPub[i]);
+  std::string name = identity.getName();
+  uint8_t nameLen = name.size() > 20 ? 20 : name.size();
+  p.push_back(nameLen);
+  for (int i = 0; i < nameLen; i++) p.push_back((uint8_t)name[i]);
+  sendFrame(dst, type, p.data(), p.size());
+}
+
+// Cifra un texto para un contacto y lo envia por LoRa (E2E).
+void sendToContact(uint16_t dstId, const String &text) {
+  const Contact *c = contacts.find(dstId);
+  if (!c || !c->hasKey || !e2eReady) {
+    notifyPhone("ERR:contacto desconocido");
+    return;
   }
-  LoRa.endPacket();
+  uint8_t aesKey[32];
+  if (!e2e.deriveAesKey(myPriv, c->pubKey, aesKey)) {
+    notifyPhone("ERR:clave");
+    return;
+  }
+  uint8_t out[300];
+  int n = e2e.encrypt(aesKey, (const uint8_t *)text.c_str(), text.length(), out,
+                      sizeof(out));
+  if (n < 0) {
+    notifyPhone("ERR:cifrado");
+    return;
+  }
+  sendFrame(dstId, TYPE_DATA, out, n);
+  lastEvent = "Yo->" + String(c->name.c_str()) + ": " + text;
+  displayStatus();
 }
 
-// Envia un paquete de handshake de emparejamiento (sin payload util).
-void sendPairPacket(uint8_t type, uint8_t to, uint16_t pairId) {
-  LoRa.beginPacket();
-  LoRa.write(to);
-  LoRa.write(peerConfig.getNodeId());
-  LoRa.write(type);
-  LoRa.write((pairId >> 8) & 0xFF);
-  LoRa.write(pairId & 0xFF);
-  LoRa.endPacket();
+// ==================== CONTACTOS EN NVS ====================
+// Blob: [count][ id(2) | pubkey(32) | nameLen(1) | name ] x count
+void saveContacts() {
+  std::vector<uint8_t> b;
+  b.push_back((uint8_t)contacts.count());
+  for (int i = 0; i < contacts.count(); i++) {
+    const Contact &c = contacts.get(i);
+    b.push_back((c.id >> 8) & 0xFF);
+    b.push_back(c.id & 0xFF);
+    for (int j = 0; j < 32; j++) b.push_back(c.pubKey[j]);
+    uint8_t nl = c.name.size() > 20 ? 20 : c.name.size();
+    b.push_back(nl);
+    for (int j = 0; j < nl; j++) b.push_back((uint8_t)c.name[j]);
+  }
+  prefs.putBytes("contacts", b.data(), b.size());
 }
 
-// Guarda el estado de emparejamiento en NVS.
-void persistPairing() {
-  prefs.putBool("paired", pairing.isPaired());
-  prefs.putUShort("pair_id", pairing.pairId());
-  prefs.putUChar("pair_peer", pairing.peerId());
+void loadContacts() {
+  size_t len = prefs.getBytesLength("contacts");
+  if (len == 0) return;
+  std::vector<uint8_t> b(len);
+  prefs.getBytes("contacts", b.data(), len);
+  size_t pos = 0;
+  if (pos >= b.size()) return;
+  uint8_t count = b[pos++];
+  for (uint8_t i = 0; i < count && pos + 35 <= b.size(); i++) {
+    uint16_t id = ((uint16_t)b[pos] << 8) | b[pos + 1];
+    pos += 2;
+    uint8_t pub[32];
+    memcpy(pub, &b[pos], 32);
+    pos += 32;
+    uint8_t nl = b[pos++];
+    std::string nm;
+    if (pos + nl <= b.size()) {
+      nm.assign((char *)&b[pos], nl);
+      pos += nl;
+    }
+    contacts.addOrUpdate(id, nm, pub);
+  }
 }
 
-// Procesa un comando de control recibido por BLE.
+// ==================== COMANDOS ====================
 void handleControlCommand(const String &line) {
+  // Comandos con argumentos propios (no en ControlCommand): SETNAME, SEND, LIST.
+  if (line.startsWith("SETNAME:")) {
+    String nm = line.substring(8);
+    nm.trim();
+    identity.setName(std::string(nm.c_str()));
+    prefs.putString("name", identity.getName().c_str());
+    notifyPhone("NAME:" + String(identity.getName().c_str()));
+    Serial.printf("Nombre: %s (aplica al reiniciar el advert BLE)\n",
+                  identity.getName().c_str());
+    displayStatus();
+    return;
+  }
+  if (line.startsWith("SEND:")) {
+    int colon = line.indexOf(':', 5);
+    if (colon > 0) {
+      uint16_t dst = (uint16_t)strtol(line.substring(5, colon).c_str(), nullptr, 16);
+      sendToContact(dst, line.substring(colon + 1));
+    }
+    return;
+  }
+  if (line == "LIST") {
+    String out = "CONTACTS:";
+    for (int i = 0; i < contacts.count(); i++) {
+      const Contact &c = contacts.get(i);
+      out += hex16(c.id) + "=" + String(c.name.c_str());
+      if (i < contacts.count() - 1) out += ",";
+    }
+    notifyPhone(out);
+    return;
+  }
+  if (line == "WHOAMI") {
+    notifyPhone("ME:" + hex16(identity.getId()) + ":" +
+                String(identity.getName().c_str()));
+    return;
+  }
+
   Command cmd = parseControlCommand(std::string(line.c_str()));
   switch (cmd.type) {
     case CMD_PAIR:
       pairingPin = String(cmd.arg.c_str());
       pairing.startPairing(cmd.arg);
-      Serial.print("Modo emparejamiento, pairId="); Serial.println(pairing.pendingPairId());
-      DLOGF("[DIAG] PAIR pin=%s pairId=%u\n", pairingPin.c_str(), pairing.pendingPairId());
-      // Emite un primer PAIR_REQ inmediato.
-      sendPairPacket(TYPE_PAIR_REQ, BROADCAST_ADDR, pairing.pendingPairId());
-      displayStatus();  // muestra la pantalla de emparejamiento (PIN + pairId)
-      break;
-    case CMD_UNPAIR:
-      pairing.unpair();
-      persistPairing();
-      Serial.println("Emparejamiento deshecho.");
+      sendPairPacket(TYPE_PAIR_REQ, BROADCAST);
+      Serial.printf("Modo emparejamiento PIN=%s pairId=%u\n", pairingPin.c_str(),
+                    pairing.pendingPairId());
       displayStatus();
       break;
+    case CMD_UNPAIR: {
+      // UNPAIR:<idHex> elimina un contacto; UNPAIR solo cancela la sesion.
+      if (cmd.arg.size() > 0) {
+        uint16_t id = (uint16_t)strtol(cmd.arg.c_str(), nullptr, 16);
+        contacts.remove(id);
+        saveContacts();
+        notifyPhone("UNPAIRED:" + hex16(id));
+      }
+      pairing.cancelPairing();
+      displayStatus();
+      break;
+    }
     case CMD_UNLINK: {
-      // Borra todos los bonds BLE de este dispositivo.
-      int dev_num = esp_ble_get_bond_device_num();
-      if (dev_num > 0) {
+      int n = esp_ble_get_bond_device_num();
+      if (n > 0) {
         esp_ble_bond_dev_t *list =
-            (esp_ble_bond_dev_t *)malloc(sizeof(esp_ble_bond_dev_t) * dev_num);
+            (esp_ble_bond_dev_t *)malloc(sizeof(esp_ble_bond_dev_t) * n);
         if (list) {
-          esp_ble_get_bond_device_list(&dev_num, list);
-          for (int i = 0; i < dev_num; i++) {
-            esp_ble_remove_bond_device(list[i].bd_addr);
-          }
+          esp_ble_get_bond_device_list(&n, list);
+          for (int i = 0; i < n; i++) esp_ble_remove_bond_device(list[i].bd_addr);
           free(list);
         }
       }
@@ -588,8 +471,11 @@ void handleControlCommand(const String &line) {
       break;
     }
     case CMD_STATUS:
-      Serial.print("STATUS paired="); Serial.print(pairing.isPaired());
-      Serial.print(" peer="); Serial.println(pairing.peerId());
+      Serial.printf("STATUS id=%s name=%s contactos=%d pairing=%d\n",
+                    hex16(identity.getId()).c_str(), identity.getName().c_str(),
+                    contacts.count(), pairing.inPairingMode());
+      notifyPhone("ME:" + hex16(identity.getId()) + ":" +
+                  String(identity.getName().c_str()));
       break;
     default:
       Serial.println("Comando desconocido.");
@@ -597,42 +483,15 @@ void handleControlCommand(const String &line) {
   }
 }
 
-// Reconstruye el texto de un payload LoRa segun su tipo y bandera de compresion.
-String decodeLoraPayload(uint8_t type, const std::vector<uint8_t> &raw) {
-  if (type != 0 || raw.empty()) {
-    return String(std::string(raw.begin(), raw.end()).c_str());
+// ==================== BLE NOTIFY ====================
+void notifyPhone(const String &s) {
+  if (BLE_clients_connected > 0 && pTxCharacteristic) {
+    pTxCharacteristic->setValue((uint8_t *)s.c_str(), s.length());
+    pTxCharacteristic->notify();
   }
-  uint8_t flag = raw[0];
-  std::vector<uint8_t> body(raw.begin() + 1, raw.end());
-  if (flag == PAYLOAD_HUFFMAN) {
-    std::string decoded = huffman.decode(body);
-    return String(decoded.c_str());
-  }
-  return String(std::string(body.begin(), body.end()).c_str());
 }
 
-// Cifra el mensaje con la clave publica RSA-2048 (OAEP-SHA256) y lo publica en
-// el broker en base64. Solo quien tenga la clave privada puede descifrarlo.
-// Si la cripto no esta lista o el mensaje excede el limite, no se publica en
-// claro: se omite para no filtrar el contenido.
-void publishEncrypted(const String &msg) {
-  if (!secureCrypto.isReady()) {
-    Serial.println("SecureCrypto no inicializado: mensaje no publicado.");
-    return;
-  }
-  String encrypted = secureCrypto.encryptBase64(msg);
-  if (encrypted.length() == 0) {
-    Serial.println("Fallo al cifrar (mensaje muy largo?): no publicado.");
-    return;
-  }
-  cloud.publishMessage(encrypted);
-}
-
-void sendAck(uint8_t to, uint8_t from) {
-  sendMessage(to, from, TYPE_ACK, pairing.pairId(), "ACK");
-}
-
-// Muestra el passkey de bonding BLE en grande para que el usuario lo lea.
+// ==================== OLED ====================
 void displayPasskey(uint32_t passkey) {
   if (!displayReady) return;
   display.clearDisplay();
@@ -650,126 +509,42 @@ void displayPasskey(uint32_t passkey) {
   display.display();
 }
 
-// Pantalla mientras se emparejan dos placas: muestra el PIN y el pairId.
 void displayPairing() {
   if (!displayReady) return;
   display.clearDisplay();
   display.setTextSize(1);
   display.setCursor(0, 0);
-  display.println("EMPAREJANDO PLACAS");
+  display.println("EMPAREJANDO");
   display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
   display.setTextSize(2);
   display.setCursor(0, 18);
   display.print("PIN ");
   display.println(pairingPin.length() ? pairingPin : String("----"));
   display.setTextSize(1);
-  display.setCursor(0, 42);
-  display.print("pairId: "); display.println(pairing.pendingPairId());
-  display.setCursor(0, 54);
-  display.println("Buscando peer...");
-  display.display();
-}
-
-// Confirmacion de emparejamiento exitoso.
-void displayPaired(uint8_t peer) {
-  if (!displayReady) return;
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println("EMPAREJADO OK");
-  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
-  display.setTextSize(2);
-  display.setCursor(0, 22);
-  display.print("Peer N"); display.println(peer);
-  display.setTextSize(1);
-  display.setCursor(0, 50);
-  display.print("pairId: "); display.println(pairing.pairId());
-  display.display();
-}
-
-void displayMessage(const String &t) {
-  if (!displayReady) return;
-  display.clearDisplay();
-  display.setCursor(0, 0);
-  display.setTextSize(2);
-  display.println(t);
+  display.setCursor(0, 46);
+  display.println("Buscando contacto...");
   display.display();
 }
 
 void displayStatus() {
   if (!displayReady) return;
-  // Mientras se muestra el passkey de bonding, no lo pisamos.
   if (showingPasskey) return;
-  // En modo emparejamiento, mostramos la pantalla con el PIN/pairId.
-  if (pairing.inPairingMode()) {
-    displayPairing();
-    return;
-  }
+  if (pairing.inPairingMode()) { displayPairing(); return; }
+
   display.clearDisplay();
   display.setTextSize(1);
   display.setCursor(0, 0);
-
-  // Header
-  display.print("N"); display.print(peerConfig.getNodeId());
-  display.print(" B:");
-  if (BLE_clients_connected > 0) {
-    display.print(BLE_clients_connected);
-  } else {
-    display.print("-");
-  }
-  display.print(" W:");
-  if (cloud.isConnected()) {
-    display.print("1");
-  } else {
-    display.print("0");
-  }
-  display.print(" ");
-  // Estado de emparejamiento de placas.
-  if (pairing.inPairingMode()) {
-    display.println("PAIR..");
-  } else if (pairing.isPaired()) {
-    display.print("P"); display.println(pairing.peerId());
-  } else if (protocol.isWaitingForAck()) {
-    display.println("ACK");
-  } else {
-    display.println("ok");
-  }
-
-  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
-  
-  // Mostrar últimos 4 mensajes
-  int bufSize = msgManager.getSize();
-  int startIdx = (msgManager.getHeadIndex() - 4 + bufSize) % bufSize;
-  int line = 12;
-  
-  for (int i = 0; i < 4; i++) {
-    int idx = (startIdx + i) % bufSize;
-    Message m = msgManager.getMessage(idx);
-    if (m.from != 0) {
-      display.setCursor(0, line);
-      if (m.isBLE) {
-        display.print("B");
-      } else {
-        display.print("L");
-      }
-      display.print((m.from == peerConfig.getNodeId()) ? ">" : "<");
-      display.print(m.from);
-      display.print(": ");
-      display.println(m.text);
-      line += 10;
-    }
-  }
-  
-  display.drawLine(0, 53, 128, 53, SSD1306_WHITE);
-  display.setCursor(0, 55);
-  display.print("RSSI: ");
-  
-  Message lastM = msgManager.getMessage((msgManager.getHeadIndex() - 1 + bufSize) % bufSize);
-  if (lastM.from != 0) {
-    display.println(lastM.rssi);
-  } else {
-    display.println("--");
-  }
-  
+  // Nombre propio + id
+  display.print(identity.getName().c_str());
+  display.setCursor(0, 12);
+  display.print("ID:"); display.print(hex16(identity.getId()));
+  display.print(" BLE:"); display.print(BLE_clients_connected > 0 ? "1" : "-");
+  display.print(" C:"); display.print(contacts.count());
+  display.drawLine(0, 22, 128, 22, SSD1306_WHITE);
+  // Ultimo evento/mensaje
+  display.setCursor(0, 28);
+  String e = lastEvent;
+  if (e.length() > 63) e = e.substring(0, 63);
+  display.println(e);
   display.display();
 }
