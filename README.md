@@ -112,29 +112,41 @@ opción más chica, así un mensaje corto nunca crece.
 - Buffer autodescriptivo: incluye la tabla de frecuencias, el receptor reconstruye
   el mismo árbol y decodifica.
 
-### Cifrado clave pública/privada hacia el broker
+### Cifrado clave pública/privada hacia el broker (RSA-2048, producción)
 
-Todo lo que la placa publica en el broker se cifra con RSA usando la **clave
-pública** `(e, n)` definida en `secrets.h`. Solo quien tenga la **clave privada**
-`(d)` puede descifrarlo. La placa nunca conoce `d`.
+Todo lo que la placa publica en el broker se cifra con **RSA-2048 + OAEP
+(SHA-256)** usando mbedtls (incluido en Arduino-ESP32). Se cifra con la **clave
+pública** y se publica en **base64**; solo quien tenga la **clave privada** puede
+descifrarlo. La placa nunca conoce la privada.
 
-- Módulo: `arduino/LoRaPeer/lib/Crypto/RsaCipher.{h,cpp}` (RSA didáctico de 32 bits, C++ puro)
-- El mensaje se cifra byte a byte y se publica como texto hexadecimal.
-- Configurá tu par real en `secrets.h` (`CLOUD_RSA_E`, `CLOUD_RSA_N`) y guardá `d`
-  fuera del dispositivo, en el consumidor del broker.
+- Módulo: `arduino/LoRaPeer/lib/SecureCrypto/SecureCrypto.{h,cpp}`
+- Generá tu par y pegá la pública en `secrets.h`; guardá la privada fuera del
+  dispositivo:
+  ```bash
+  openssl genrsa -out priv.pem 2048
+  openssl rsa -in priv.pem -pubout -out pub.pem   # -> CLOUD_RSA_PUBLIC_KEY
+  ```
+- Si la cripto no está lista o el mensaje excede el límite OAEP, el mensaje **no
+  se publica en claro** (se omite) para no filtrar contenido.
+
+### TLS del broker
+
+La conexión MQTT valida el certificado del broker contra la CA raíz
+**ISRG Root X1** (`secureClient.setCACert(...)` en `CloudManager`), evitando
+ataques man-in-the-middle.
 
 ### Pruebas (TDD)
 
-La lógica pura se prueba sin hardware con un entorno nativo de PlatformIO:
+La compresión Huffman (lógica pura) se prueba sin hardware:
 
 ```bash
 cd arduino/LoRaPeer
 pio test -e native
 ```
 
-Cubre roundtrip de compresión, casos borde (vacío, símbolo único, bytes altos),
-compresión efectiva, generación de claves RSA, roundtrip de cifrado y que solo la
-clave privada correcta descifra.
+El cifrado RSA-2048 usa mbedtls (solo en la placa). Su interoperabilidad se
+verifica del lado de la app contra un vector generado con OpenSSL (mismo esquema
+OAEP-SHA256): lo que cifra la placa, la app lo descifra.
 
 ## Próximos pasos (opcional)
 

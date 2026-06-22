@@ -14,7 +14,7 @@
 #include "PeerConfig.h"
 #include "CloudManager.h"
 #include "HuffmanCodec.h"
-#include "RsaCipher.h"
+#include "SecureCrypto.h"
 #include "secrets.h"
 #include <string>
 #include <vector>
@@ -43,6 +43,7 @@ ProtocolState protocol(5000);
 PeerConfig peerConfig;
 CloudManager cloud;
 HuffmanCodec huffman;
+SecureCrypto secureCrypto;
 
 // Banderas del primer byte del payload LoRa de datos.
 const uint8_t PAYLOAD_RAW = 0;
@@ -208,6 +209,13 @@ config_done:
   cloud.setCallback(mqttCallback);
   cloud.begin();
 
+  // Inicializar cifrado de produccion (RSA-2048 OAEP) con la clave publica.
+  if (secureCrypto.begin(CLOUD_RSA_PUBLIC_KEY)) {
+    Serial.println("SecureCrypto listo (RSA-2048 OAEP-SHA256).");
+  } else {
+    Serial.println("ERROR: no se pudo cargar la clave publica RSA.");
+  }
+
   // ==================== INICIALIZAR BLE ====================
   String deviceName = "LoRA_N" + String(peerConfig.getNodeId());
   BLEDevice::init(deviceName.c_str());
@@ -350,19 +358,21 @@ String decodeLoraPayload(uint8_t type, const std::vector<uint8_t> &raw) {
   return String(std::string(body.begin(), body.end()).c_str());
 }
 
-// Cifra el mensaje con la clave publica RSA y lo publica en el broker como hex.
-// Solo quien tenga la clave privada (d) puede descifrarlo.
+// Cifra el mensaje con la clave publica RSA-2048 (OAEP-SHA256) y lo publica en
+// el broker en base64. Solo quien tenga la clave privada puede descifrarlo.
+// Si la cripto no esta lista o el mensaje excede el limite, no se publica en
+// claro: se omite para no filtrar el contenido.
 void publishEncrypted(const String &msg) {
-  std::vector<uint8_t> cipher =
-      RsaCipher::encrypt(std::string(msg.c_str()), CLOUD_RSA_E, CLOUD_RSA_N);
-  static const char *H = "0123456789abcdef";
-  String hex;
-  hex.reserve(cipher.size() * 2);
-  for (uint8_t b : cipher) {
-    hex += H[b >> 4];
-    hex += H[b & 0x0F];
+  if (!secureCrypto.isReady()) {
+    Serial.println("SecureCrypto no inicializado: mensaje no publicado.");
+    return;
   }
-  cloud.publishMessage(hex);
+  String encrypted = secureCrypto.encryptBase64(msg);
+  if (encrypted.length() == 0) {
+    Serial.println("Fallo al cifrar (mensaje muy largo?): no publicado.");
+    return;
+  }
+  cloud.publishMessage(encrypted);
 }
 
 void sendAck(uint8_t to, uint8_t from) {
