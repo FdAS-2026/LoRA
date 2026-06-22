@@ -467,7 +467,9 @@ void handleControlCommand(const String &line) {
           free(list);
         }
       }
+      lastEvent = "";  // ya no hay dueño: limpiar pantalla
       Serial.println("Bonds BLE borrados.");
+      displayStatus();
       break;
     }
     case CMD_STATUS:
@@ -531,6 +533,8 @@ void displayStatus() {
   if (showingPasskey) return;
   if (pairing.inPairingMode()) { displayPairing(); return; }
 
+  bool hasOwner = esp_ble_get_bond_device_num() > 0;
+
   display.clearDisplay();
   display.setTextSize(1);
   display.setCursor(0, 0);
@@ -541,10 +545,21 @@ void displayStatus() {
   display.print(" BLE:"); display.print(BLE_clients_connected > 0 ? "1" : "-");
   display.print(" C:"); display.print(contacts.count());
   display.drawLine(0, 22, 128, 22, SSD1306_WHITE);
-  // Ultimo evento/mensaje
+
   display.setCursor(0, 28);
-  String e = lastEvent;
-  if (e.length() > 63) e = e.substring(0, 63);
-  display.println(e);
+  if (!hasOwner) {
+    // Sin telefono dueño: lista para vincular desde la app.
+    display.setTextSize(1);
+    display.println("Sin telefono.");
+    display.setCursor(0, 40);
+    display.println("Vincula desde la");
+    display.setCursor(0, 50);
+    display.println("app (BLE).");
+  } else {
+    // Con dueño: ultimo evento/mensaje.
+    String e = lastEvent;
+    if (e.length() > 63) e = e.substring(0, 63);
+    display.println(e.length() ? e : String("Conectado."));
+  }
   display.display();
 }
