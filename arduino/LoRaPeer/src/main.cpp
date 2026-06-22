@@ -75,11 +75,23 @@ BLECharacteristic* pTxCharacteristic = NULL;
 String lastMsgSent = "";
 uint32_t blePasskey = 0;        // passkey BLE a mostrar en la OLED
 bool showingPasskey = false;
+String pairingPin = "";         // PIN de emparejamiento de placas (para la OLED)
+
+// Logs detallados solo en build de prueba (flag -D DIAG_LOGS).
+#ifdef DIAG_LOGS
+  #define DLOG(x)    Serial.println(x)
+  #define DLOGF(...) Serial.printf(__VA_ARGS__)
+#else
+  #define DLOG(x)
+  #define DLOGF(...)
+#endif
 
 // ==================== FORWARD DECLARATIONS ====================
 void displayStatus();
 void displayMessage(const String &t);
 void displayPasskey(uint32_t passkey);
+void displayPairing();
+void displayPaired(uint8_t peer);
 void sendMessage(uint8_t to, uint8_t from, uint8_t type, uint16_t pairId, const String &msg);
 void sendAck(uint8_t to, uint8_t from);
 void sendPairPacket(uint8_t type, uint8_t to, uint16_t pairId);
@@ -111,6 +123,7 @@ class MyServerCallbacks: public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
     BLE_clients_connected++;
     Serial.print("BLE: Cliente conectado. Total: "); Serial.println(BLE_clients_connected);
+    DLOG("[DIAG] BLE onConnect");
     displayStatus();
   };
 
@@ -166,6 +179,7 @@ class MySecurityCallbacks: public BLESecurityCallbacks {
     blePasskey = pass_key;
     showingPasskey = true;
     Serial.print("BLE passkey: "); Serial.println(pass_key);
+    DLOGF("[DIAG] BLE passkey notify=%06u -> OLED\n", pass_key);
     displayPasskey(pass_key);
   }
   bool onConfirmPIN(uint32_t) { return true; }
@@ -351,6 +365,21 @@ void loop() {
     if (cmd.startsWith("ENC ")) {
       String out = secureCrypto.encryptBase64(cmd.substring(4));
       Serial.print("ENC_OUT="); Serial.println(out);
+#ifdef DIAG_LOGS
+    } else if (cmd.startsWith("TESTUI")) {
+      // Prueba de pantallas sin telefono/segunda placa.
+      String which = cmd.substring(6); which.trim();
+      if (which == "passkey") {
+        showingPasskey = true; displayPasskey(123456);
+        Serial.println("[DIAG] OLED -> passkey 123456");
+      } else if (which == "paired") {
+        displayPaired(2);
+        Serial.println("[DIAG] OLED -> emparejado N2");
+      } else {  // pairing
+        pairingPin = "1234"; pairing.startPairing("1234"); displayPairing();
+        Serial.println("[DIAG] OLED -> emparejando PIN 1234");
+      }
+#endif
     } else if (cmd == "STATUS") {
       Serial.print("STATUS node="); Serial.print(peerConfig.getNodeId());
       Serial.print(" paired="); Serial.print(pairing.isPaired());
@@ -378,6 +407,7 @@ void loop() {
 
     if (type == TYPE_PAIR_REQ || type == TYPE_PAIR_ACK) {
       // Handshake de emparejamiento (se procesa sin filtro de destino).
+      DLOGF("[DIAG] RX pair type=%u pairId=%u from=N%u\n", type, pktPairId, from);
       PairAction action = pairing.onPairPacket(type, pktPairId, from);
       if (action != PAIR_NONE) {
         persistPairing();
@@ -385,12 +415,13 @@ void loop() {
           sendPairPacket(TYPE_PAIR_ACK, from, pairing.pairId());
         }
         Serial.print("Emparejado con N"); Serial.println(from);
+        DLOGF("[DIAG] PAIRED peer=N%u pairId=%u\n", from, pairing.pairId());
         if (BLE_clients_connected > 0 && pTxCharacteristic != NULL) {
           String n = "PAIRED:N" + String(from);
           pTxCharacteristic->setValue((uint8_t *)n.c_str(), n.length());
           pTxCharacteristic->notify();
         }
-        displayStatus();
+        displayPaired(from);
       }
     } else if (to == peerConfig.getNodeId() && pairing.acceptData(pktPairId, from)) {
       String payload = decodeLoraPayload(type, rawPayload);
@@ -493,11 +524,13 @@ void handleControlCommand(const String &line) {
   Command cmd = parseControlCommand(std::string(line.c_str()));
   switch (cmd.type) {
     case CMD_PAIR:
+      pairingPin = String(cmd.arg.c_str());
       pairing.startPairing(cmd.arg);
       Serial.print("Modo emparejamiento, pairId="); Serial.println(pairing.pendingPairId());
+      DLOGF("[DIAG] PAIR pin=%s pairId=%u\n", pairingPin.c_str(), pairing.pendingPairId());
       // Emite un primer PAIR_REQ inmediato.
       sendPairPacket(TYPE_PAIR_REQ, BROADCAST_ADDR, pairing.pendingPairId());
-      displayStatus();
+      displayStatus();  // muestra la pantalla de emparejamiento (PIN + pairId)
       break;
     case CMD_UNPAIR:
       pairing.unpair();
@@ -585,6 +618,43 @@ void displayPasskey(uint32_t passkey) {
   display.display();
 }
 
+// Pantalla mientras se emparejan dos placas: muestra el PIN y el pairId.
+void displayPairing() {
+  if (!displayReady) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("EMPAREJANDO PLACAS");
+  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setCursor(0, 18);
+  display.print("PIN ");
+  display.println(pairingPin.length() ? pairingPin : String("----"));
+  display.setTextSize(1);
+  display.setCursor(0, 42);
+  display.print("pairId: "); display.println(pairing.pendingPairId());
+  display.setCursor(0, 54);
+  display.println("Buscando peer...");
+  display.display();
+}
+
+// Confirmacion de emparejamiento exitoso.
+void displayPaired(uint8_t peer) {
+  if (!displayReady) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("EMPAREJADO OK");
+  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setCursor(0, 22);
+  display.print("Peer N"); display.println(peer);
+  display.setTextSize(1);
+  display.setCursor(0, 50);
+  display.print("pairId: "); display.println(pairing.pairId());
+  display.display();
+}
+
 void displayMessage(const String &t) {
   if (!displayReady) return;
   display.clearDisplay();
@@ -598,6 +668,11 @@ void displayStatus() {
   if (!displayReady) return;
   // Mientras se muestra el passkey de bonding, no lo pisamos.
   if (showingPasskey) return;
+  // En modo emparejamiento, mostramos la pantalla con el PIN/pairId.
+  if (pairing.inPairingMode()) {
+    displayPairing();
+    return;
+  }
   display.clearDisplay();
   display.setTextSize(1);
   display.setCursor(0, 0);
