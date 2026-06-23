@@ -40,27 +40,24 @@ emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 CloudManager::CloudManager() : mqttClient(secureClient) {
   isConfigured = false;
   lastReconnectAttempt = 0;
+  _nodeId = 0;
   _mqttServer = "ea2b2d4f22754a798415f56a0516657b.s1.eu.hivemq.cloud";
   _mqttPort = 8883;
 }
 
-String CloudManager::getTxTopic(uint8_t nodeId) {
-  return "lorapeer/node" + String(nodeId) + "/tx";
+// Funcion pura: delega en MqttCodec para el formato canonico de topic
+// -> "lorapeer/<idHex4mayus>/inbox". NO re-implementa el snprintf.
+String CloudManager::getInboxTopic(uint16_t id) {
+  return String(MqttCodec::inboxTopic(id).c_str());
 }
 
-String CloudManager::getRxTopic(uint8_t nodeId) {
-  return "lorapeer/node" + String(nodeId) + "/rx";
-}
-
-void CloudManager::configure(const String& ssid, const String& password, uint8_t nodeId, const String& mqttUser, const String& mqttPass) {
-  _ssid = ssid;
-  _password = password;
-  _nodeId = nodeId;
-  
+void CloudManager::configure(uint16_t boardId, const String& mqttUser, const String& mqttPass) {
+  _nodeId = boardId;
   _mqttUser = mqttUser;
   _mqttPass = mqttPass;
-  _clientId = "ESP32_Node_" + String(nodeId) + "_" + String(random(0xffff), HEX);
-  
+  // clientId unico por placa: evita que dos placas con el mismo usuario
+  // se desconecten mutuamente (pitfall clientId duplicado).
+  _clientId = "ESP32_Node_" + String(_nodeId) + "_" + String(random(0xffff), HEX);
   isConfigured = true;
 }
 
@@ -70,15 +67,18 @@ void CloudManager::setCallback(MQTT_CALLBACK_SIGNATURE) {
 
 void CloudManager::begin() {
   if (!isConfigured) return;
-  
-  Serial.print("Conectando a WiFi: ");
-  Serial.println(_ssid);
-  
-  WiFi.begin(_ssid.c_str(), _password.c_str());
+  // Phase 1 es dueno del WiFi (la conexion se inicia en setup() de main.cpp).
+  // begin() solo configura TLS y el servidor MQTT; no modifica el estado WiFi.
 
-  // Validar el certificado del broker contra la CA raiz (TLS seguro).
+  // Fix B-01: acotar el handshake TLS para evitar stall indefinido en hardware.
+  // setTimeout: timeout del socket TCP (en SEGUNDOS en WiFiClientSecure/ESP32).
+  // setHandshakeTimeout: timeout del handshake TLS (en SEGUNDOS, NO en ms).
+  // RIESGO PENDIENTE (validar en hardware): si el DNS tarda mas de 10 s,
+  // el stall puede ocurrir antes del handshake y estos timeouts no lo cubren.
+  secureClient.setTimeout(10);           // socket TCP: 10 s
+  secureClient.setHandshakeTimeout(10);  // TLS handshake: 10 s (en segundos)
+
   secureClient.setCACert(BROKER_ROOT_CA);
-
   mqttClient.setServer(_mqttServer.c_str(), _mqttPort);
 }
 
@@ -86,27 +86,34 @@ void CloudManager::reconnect() {
   if (WiFi.status() != WL_CONNECTED) {
     return; // No intentar MQTT si no hay WiFi
   }
-  
+
   if (millis() - lastReconnectAttempt > 5000) {
     lastReconnectAttempt = millis();
-    Serial.print("Intentando conexión MQTT a HiveMQ... ");
-    
+    Serial.print("Intentando conexion MQTT a HiveMQ... ");
+
     if (mqttClient.connect(_clientId.c_str(), _mqttUser.c_str(), _mqttPass.c_str())) {
-      Serial.println("¡Conectado a HiveMQ!");
-      // Suscribirse al topic de recepción de este nodo
-      String rxTopic = getRxTopic(_nodeId);
-      mqttClient.subscribe(rxTopic.c_str());
-      Serial.println("Suscrito a: " + rxTopic);
+      Serial.println("Conectado a HiveMQ!");
+      // Suscribirse al inbox propio con QoS1: el broker reentrega si se pierde el PUBACK.
+      String inboxTopic = getInboxTopic(_nodeId);
+      if (!mqttClient.subscribe(inboxTopic.c_str(), 1)) {
+        Serial.println("[MQTT] ERR: subscribe fallo - sin mensajes entrantes");
+        mqttClient.disconnect();
+      } else {
+        Serial.println("Suscrito a: " + inboxTopic);
+      }
+      Serial.printf("[MEM] heap=%u minheap=%u stackHWM=%u\n",
+                    ESP.getFreeHeap(), ESP.getMinFreeHeap(),
+                    uxTaskGetStackHighWaterMark(NULL));
     } else {
       int state = mqttClient.state();
-      Serial.print("Falló, código de error: ");
+      Serial.print("Fallo, codigo de error: ");
       Serial.print(state);
       Serial.print(" (");
-      if (state == -2) Serial.print("Fallo de conexión TLS/SSL");
+      if (state == -2) Serial.print("Fallo de conexion TLS/SSL");
       else if (state == -4) Serial.print("Timeout de red");
-      else if (state == 4) Serial.print("Credenciales inválidas");
+      else if (state == 4) Serial.print("Credenciales invalidas");
       else if (state == 5) Serial.print("No autorizado");
-      else Serial.print("Ver PubSubClient.h para el código");
+      else Serial.print("Ver PubSubClient.h para el codigo");
       Serial.println(") - intentando de nuevo en 5 segundos");
     }
   }
@@ -114,7 +121,7 @@ void CloudManager::reconnect() {
 
 void CloudManager::loop() {
   if (!isConfigured) return;
-  
+
   if (WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected()) {
       reconnect();
@@ -128,12 +135,15 @@ bool CloudManager::isConnected() {
   return (WiFi.status() == WL_CONNECTED && mqttClient.connected());
 }
 
-bool CloudManager::publishMessage(const String& message) {
-  if (isConnected()) {
-    String txTopic = getTxTopic(_nodeId);
-    return mqttClient.publish(txTopic.c_str(), message.c_str());
+bool CloudManager::publishBlob(const String& topic, const uint8_t* data, size_t len) {
+  // publish es QoS0 efectivo (PubSubClient no soporta QoS1 en publish);
+  // sobre TLS/TCP con ambos online alcanza.
+  if (!isConnected()) return false;
+  bool ok = mqttClient.publish(topic.c_str(), data, (unsigned int)len, false);
+  if (!ok) {
+    Serial.printf("[MQTT] publish fallo, len=%u\n", (unsigned int)len);
   }
-  return false;
+  return ok;
 }
 
 int CloudManager::getMqttState() { return mqttClient.state(); }

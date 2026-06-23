@@ -4,21 +4,20 @@
 #include <Arduino.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
+#include "MqttCodec.h"
 
 class CloudManager {
 private:
-  String _ssid;
-  String _password;
   String _mqttServer;
   int _mqttPort;
   String _mqttUser;
   String _mqttPass;
   String _clientId;
-  uint8_t _nodeId;
-  
+  uint16_t _nodeId;
+
   WiFiClientSecure secureClient;
   PubSubClient mqttClient;
-  
+
   bool isConfigured;
   unsigned long lastReconnectAttempt;
 
@@ -26,22 +25,25 @@ private:
 
 public:
   CloudManager();
-  
-  void configure(const String& ssid, const String& password, uint8_t nodeId, const String& mqttUser, const String& mqttPass);
-  
-  // Funciones puras para pruebas unitarias
-  String getTxTopic(uint8_t nodeId);
-  String getRxTopic(uint8_t nodeId);
-  
+
+  void configure(uint16_t boardId, const String& mqttUser, const String& mqttPass);
+
+  // Funcion pura para pruebas unitarias: devuelve el topic inbox canonico del id dado.
+  // Delega en MqttCodec::inboxTopic -> "lorapeer/<idHex4mayus>/inbox".
+  String getInboxTopic(uint16_t id);
+
   void begin();
   void loop();
-  
+
   bool isConnected();
-  bool publishMessage(const String& message);
-  
+
+  // Publica un blob binario en el topic indicado (QoS0 efectivo — PubSubClient no
+  // soporta QoS1 en publish; sobre TLS/TCP con ambos online alcanza).
+  bool publishBlob(const String& topic, const uint8_t* data, size_t len);
+
   int getMqttState();
   int getWifiStatus();
-  
+
   void setCallback(MQTT_CALLBACK_SIGNATURE);
 };
 

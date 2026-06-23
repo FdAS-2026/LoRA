@@ -19,6 +19,13 @@
 #include "ControlCommand.h"
 #include <string>
 #include <vector>
+#include <WiFi.h>
+#include "WifiCommand.h"
+#include "CloudManager.h"
+#include "MqttCodec.h"
+#include "InflightTable.h"
+#include "DedupRing.h"
+#include "secrets.h"
 
 // Mensajeria E2E sobre LoRa, sin internet (tipo WhatsApp offline):
 //   - 1 telefono <-> 1 placa (su identidad; enlace BLE con passkey).
@@ -41,14 +48,23 @@ Identity identity;
 ContactBook contacts;
 E2ECrypto e2e;
 PairingManager pairing;
+CloudManager cloud;
+InflightTable inflight;
+DedupRing dedup;
+
+// Contador de msgId para mensajes salientes (uint16_t; 0 reservado para paquetes sin tracking).
+static uint16_t _msgCounter = 0;
 
 uint8_t myPriv[32], myPub[32];
 bool e2eReady = false;
 
-// Tipos y direcciones de trama LoRa: [dstHi][dstLo][srcHi][srcLo][type][payload]
-const uint8_t TYPE_DATA = 0;
+// Tipos y direcciones de trama LoRa: [dst(2)][src(2)][type(1)][msgId(2)][payload]
+// Header de 7 bytes; msgId=0 en paquetes de pairing (no requieren tracking).
+const uint8_t TYPE_DATA     = 0;
 const uint8_t TYPE_PAIR_REQ = 2;
 const uint8_t TYPE_PAIR_ACK = 3;
+const uint8_t TYPE_ACK      = 4;  // confirmacion de entrega (sin cifrar)
+const uint8_t TYPE_NACK     = 5;  // rechazo de entrega (sin cifrar)
 const uint16_t BROADCAST = 0xFFFF;
 
 // -------------------- BLE
@@ -67,6 +83,14 @@ String pairingPin = "";
 String lastEvent = "";
 bool claimed = false;  // un telefono ya se vinculo como dueno
 
+// -------------------- WiFi STA (no bloqueante, sin CloudManager)
+enum WifiConnState { WIFI_NO_CREDS, WIFI_CONNECTING, WIFI_CONNECTED, WIFI_NO_NET };
+static WifiConnState wifiConnState = WIFI_NO_CREDS;
+static String wifiSSID = "";
+static String wifiPass  = "";
+static unsigned long lastWifiPoll = 0;
+static const unsigned long WIFI_POLL_MS = 2000;
+
 // Logs detallados solo en build de prueba (-D DIAG_LOGS).
 #ifdef DIAG_LOGS
   #define DLOGF(...) Serial.printf(__VA_ARGS__)
@@ -79,18 +103,57 @@ void displayStatus();
 void displayPasskey(uint32_t passkey);
 void displayPairing();
 void notifyPhone(const String &s);
-void sendFrame(uint16_t dst, uint8_t type, const uint8_t *payload, size_t len);
+void sendFrame(uint16_t dst, uint8_t type, uint16_t msgId, const uint8_t *payload, size_t len);
 void sendPairPacket(uint8_t type, uint16_t dst);
 void handleControlCommand(const String &line);
 void sendToContact(uint16_t dstId, const String &text);
 void saveContacts();
 void loadContacts();
+String wifiStateStr();
+void wifiPoll();
+void sendAck(uint16_t dst, uint16_t msgId, bool viaLoRa);
+void sendNack(uint16_t dst, uint16_t msgId, bool viaLoRa);
+void handleDataPacket(uint16_t src, uint16_t msgId, bool viaLoRa, const uint8_t* blob, size_t len);
+void onMqttMessage(char* topic, byte* payload, unsigned int length);
 
 // ==================== HELPERS ====================
 static String hex16(uint16_t v) {
   char b[5];
   snprintf(b, sizeof(b), "%04X", v);
   return String(b);
+}
+
+// Traduce el estado interno WiFi al string que se publica por BLE.
+// CONNECTING se reporta como sin_red (transicion; no tiene red aun).
+String wifiStateStr() {
+  switch (wifiConnState) {
+    case WIFI_CONNECTED:  return "conectado";
+    case WIFI_NO_NET:     return "sin_red";
+    case WIFI_CONNECTING: return "sin_red";
+    default:              return "sin_cred";
+  }
+}
+
+// Poll no bloqueante del estado WiFi (llamar desde loop() cada iteracion).
+// Guard millis() evita llamadas excesivas a WiFi.status() que podrian
+// interferir con Bluedroid. Notifica por BLE solo cuando el estado cambia.
+void wifiPoll() {
+  if (wifiConnState == WIFI_NO_CREDS) return;
+  unsigned long now = millis();
+  if (now - lastWifiPoll < WIFI_POLL_MS) return;
+  lastWifiPoll = now;
+
+  WifiConnState prev = wifiConnState;
+  wl_status_t st = WiFi.status();
+  WifiConnState next;
+  if (st == WL_CONNECTED) next = WIFI_CONNECTED;
+  else if (st == WL_NO_SSID_AVAIL || st == WL_CONNECT_FAILED || st == WL_CONNECTION_LOST) next = WIFI_NO_NET;
+  else next = WIFI_CONNECTING;
+  wifiConnState = next;
+  if (wifiConnState != prev) {
+    notifyPhone("WIFI:" + wifiStateStr());
+    displayStatus();
+  }
 }
 
 // ==================== BLE CALLBACKS ====================
@@ -183,6 +246,19 @@ void setup() {
                 identity.getName().c_str(), hex16(identity.getId()).c_str(),
                 contacts.count());
 
+  // WiFi STA: autoconexion al boot si hay credenciales persistidas en NVS.
+  // WiFi.begin() retorna inmediatamente; la conexion ocurre en background.
+  // NUNCA busy-wait aqui: LoRa y BLE deben seguir funcionando.
+  wifiSSID = prefs.getString("wifi_ssid", "");
+  wifiPass  = prefs.getString("wifi_pass", "");
+  if (wifiSSID.length() > 0) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+    wifiConnState = WIFI_CONNECTING;
+    Serial.printf("[WiFi] Iniciando conexion a '%s'...\n", wifiSSID.c_str());
+  }
+
   // BLE: nombre = identidad. Caracteristicas SIN cifrado obligatorio para que
   // la conexion sea robusta (no depende de bonds que se desincronizan). Los
   // mensajes igual van E2E cifrados de placa a placa por LoRa.
@@ -210,8 +286,15 @@ void setup() {
   BLEDevice::startAdvertising();
   BLEDevice::setMTU(185);
 
+  // MQTT cloud: configure -> setCallback (ANTES de begin, pitfall #6) -> begin.
+  // begin() solo setea CACert+server; la conexion ocurre cooperativamente en cloud.loop().
+  cloud.configure(identity.getId(), HIVEMQ_USER, HIVEMQ_PASS);
+  cloud.setCallback(onMqttMessage);
+  cloud.begin();
+
   Serial.println(e2eReady ? "E2ECrypto listo." : "E2ECrypto FALLO.");
   displayStatus();
+  Serial.printf("[MEM] Free heap: %u bytes\n", ESP.getFreeHeap());
 }
 
 // ==================== LOOP ====================
@@ -223,12 +306,13 @@ void loop() {
     if (cmd.length() > 0) handleControlCommand(cmd);
   }
 
-  // Recibir LoRa
+  // Recibir LoRa — header 7B: [dst(2)][src(2)][type(1)][msgId(2)][payload]
   int pkt = LoRa.parsePacket();
-  if (pkt >= 5) {
-    uint16_t dst = ((uint16_t)LoRa.read() << 8) | LoRa.read();
-    uint16_t src = ((uint16_t)LoRa.read() << 8) | LoRa.read();
-    uint8_t type = LoRa.read();
+  if (pkt >= 7) {
+    uint16_t dst    = ((uint16_t)LoRa.read() << 8) | LoRa.read();
+    uint16_t src    = ((uint16_t)LoRa.read() << 8) | LoRa.read();
+    uint8_t  type   = LoRa.read();
+    uint16_t msgId  = ((uint16_t)LoRa.read() << 8) | LoRa.read();
     std::vector<uint8_t> payload;
     while (LoRa.available()) payload.push_back((uint8_t)LoRa.read());
     int rssi = LoRa.packetRssi();
@@ -264,24 +348,27 @@ void loop() {
         }
       }
     } else if (type == TYPE_DATA && forMe) {
-      // Mensaje E2E de un contacto: descifrar con la clave compartida.
-      const Contact *c = contacts.find(src);
-      if (c && c->hasKey && e2eReady) {
-        uint8_t aesKey[32];
-        if (e2e.deriveAesKey(myPriv, c->pubKey, aesKey)) {
-          uint8_t clear[256];
-          int n = e2e.decrypt(aesKey, payload.data(), payload.size(), clear,
-                              sizeof(clear));
-          if (n >= 0) {
-            String text((char *)clear, n);
-            lastEvent = String(c->name.c_str()) + ": " + text;
-            notifyPhone("MSG:" + hex16(src) + ":" + text);
-            Serial.printf("MSG de %s: %s\n", c->name.c_str(), text.c_str());
-            displayStatus();
-          } else {
-            DLOGF("[DIAG] fallo descifrado de %s\n", hex16(src).c_str());
-          }
-        }
+      // Deduplicacion: descarta reintentos/duplicados del mismo (src, msgId).
+      // Si ya fue procesado, re-emite ACK para que el remitente no reintente.
+      if (!dedup.seen(src, msgId)) {
+        handleDataPacket(src, msgId, true, payload.data(), payload.size());
+      } else {
+        DLOGF("[DIAG] duplicado descartado src=%s msgId=%04X\n", hex16(src).c_str(), msgId);
+        sendAck(src, msgId, true);  // re-ACK: ya fue procesado, no reintentar
+      }
+    } else if (type == TYPE_ACK && forMe) {
+      int slot = inflight.find(msgId);
+      if (slot >= 0) {
+        notifyPhone("ACK:" + hex16(msgId) + ":lora");
+        inflight.release(slot);
+        DLOGF("[DIAG] ACK recibido LoRa msgId=%04X\n", msgId);
+      }
+    } else if (type == TYPE_NACK && forMe) {
+      int slot = inflight.find(msgId);
+      if (slot >= 0) {
+        notifyPhone("NACK:" + hex16(msgId));
+        inflight.release(slot);
+        DLOGF("[DIAG] NACK recibido LoRa msgId=%04X\n", msgId);
       }
     }
     (void)bcast; (void)rssi;
@@ -298,17 +385,61 @@ void loop() {
     DLOGF("[DIAG] TX PAIR_REQ pid=%u\n", pairing.pendingPairId());
   }
 
+  // Chequeo de timeouts de mensajes en vuelo (guard 500 ms).
+  // LORA → MQTT a los 3 s; MQTT → FAIL a los 5 s adicionales.
+  {
+    static uint32_t lastInflightCheck = 0;
+    uint32_t nowMs = (uint32_t)millis();
+    if (nowMs - lastInflightCheck >= 500) {
+      lastInflightCheck = nowMs;
+      for (int i = 0; i < InflightTable::CAP; i++) {
+        if (inflight.stage(i) == InflightTable::EMPTY) continue;
+        InflightTable::DueAction da = inflight.due(i, nowMs, 3000, 5000);
+        if (da == InflightTable::DUE_FALLBACK) {
+          uint16_t mid  = inflight.msgId(i);
+          uint16_t dst  = inflight.dst(i);
+          const uint8_t* blob = inflight.blob(i);
+          size_t         blen = inflight.blobLen(i);
+          if (cloud.isConnected()) {
+            cloud.publishBlob(cloud.getInboxTopic(dst), blob, blen);
+            inflight.promoteToMqtt(i, nowMs);  // solo si se publico; timeout FAIL si no llega ACK
+            DLOGF("[DIAG] Fallback MQTT msgId=%04X dst=%04X\n", mid, dst);
+          } else {
+            // WiFi no disponible: el slot permanece en LORA para reintentar cuando conecte.
+            // Throttle por slot: emitir NEEDNET a lo sumo una vez cada 3 s.
+            static uint32_t lastNeednet[InflightTable::CAP] = {};
+            if (nowMs - lastNeednet[i] >= 3000) {
+              notifyPhone("NEEDNET:" + hex16(mid));
+              lastNeednet[i] = nowMs;
+              DLOGF("[DIAG] NEEDNET msgId=%04X dst=%04X (sin WiFi)\n", mid, dst);
+            }
+          }
+        } else if (da == InflightTable::DUE_FAIL) {
+          uint16_t mid = inflight.msgId(i);
+          notifyPhone("FAIL:" + hex16(mid));
+          inflight.release(i);
+          DLOGF("[DIAG] FAIL msgId=%04X\n", mid);
+        }
+      }
+    }
+  }
+
+  wifiPoll();
+  cloud.loop();  // reconexion MQTT con guard millis() 5s interno
   delay(10);
 }
 
 // ==================== ENVIO LoRa ====================
-void sendFrame(uint16_t dst, uint8_t type, const uint8_t *payload, size_t len) {
+// Header 7B: [dst(2)][src(2)][type(1)][msgId(2)]. msgId=0 para paquetes sin tracking.
+void sendFrame(uint16_t dst, uint8_t type, uint16_t msgId, const uint8_t *payload, size_t len) {
   LoRa.beginPacket();
   LoRa.write((dst >> 8) & 0xFF);
   LoRa.write(dst & 0xFF);
   LoRa.write((identity.getId() >> 8) & 0xFF);
   LoRa.write(identity.getId() & 0xFF);
   LoRa.write(type);
+  LoRa.write((msgId >> 8) & 0xFF);
+  LoRa.write(msgId & 0xFF);
   if (payload && len) LoRa.write(payload, len);
   LoRa.endPacket();
 }
@@ -324,10 +455,120 @@ void sendPairPacket(uint8_t type, uint16_t dst) {
   uint8_t nameLen = name.size() > 20 ? 20 : name.size();
   p.push_back(nameLen);
   for (int i = 0; i < nameLen; i++) p.push_back((uint8_t)name[i]);
-  sendFrame(dst, type, p.data(), p.size());
+  sendFrame(dst, type, 0, p.data(), p.size());  // msgId=0: pairing no usa tracking
 }
 
-// Cifra un texto para un contacto y lo envia por LoRa (E2E).
+// Envia un ACK (TYPE_ACK=4) al nodo src por el medio indicado.
+// Payload vacio; msgId en header identifica el mensaje confirmado.
+// Si el medio original no esta disponible, usa el otro como fallback.
+void sendAck(uint16_t dst, uint16_t msgId, bool viaLoRa) {
+  if (viaLoRa) {
+    sendFrame(dst, TYPE_ACK, msgId, nullptr, 0);
+  } else if (cloud.isConnected()) {
+    uint8_t buf[5];
+    size_t n = MqttCodec::buildDataPayload(identity.getId(), TYPE_ACK, msgId, nullptr, 0, buf, sizeof(buf));
+    cloud.publishBlob(cloud.getInboxTopic(dst), buf, n);
+  } else {
+    // MQTT no disponible: usar LoRa como fallback para el ACK
+    sendFrame(dst, TYPE_ACK, msgId, nullptr, 0);
+  }
+}
+
+// Envia un NACK (TYPE_NACK=5) al nodo src por el medio indicado.
+// Indica que el mensaje no pudo procesarse (contacto desconocido, clave faltante
+// o fallo de descifrado). Payload vacio; msgId en header identifica el mensaje.
+// Si el medio original no esta disponible, usa el otro como fallback.
+void sendNack(uint16_t dst, uint16_t msgId, bool viaLoRa) {
+  if (viaLoRa) {
+    sendFrame(dst, TYPE_NACK, msgId, nullptr, 0);
+  } else if (cloud.isConnected()) {
+    uint8_t buf[5];
+    size_t n = MqttCodec::buildDataPayload(identity.getId(), TYPE_NACK, msgId, nullptr, 0, buf, sizeof(buf));
+    cloud.publishBlob(cloud.getInboxTopic(dst), buf, n);
+  } else {
+    // MQTT no disponible: usar LoRa como fallback para el NACK
+    sendFrame(dst, TYPE_NACK, msgId, nullptr, 0);
+  }
+}
+
+// Descifra y emite un blob E2E recibido (por LoRa o por MQTT).
+// Guard de auto-mensaje: descarta el eco del propio publish (src == this node).
+// Emite MSG:<srcHex>:<texto> por BLE y responde ACK/NACK al remitente
+// por el mismo medio por el que llego (viaLoRa=true → LoRa; false → MQTT).
+// NACK si: contacto desconocido, sin clave, deriveAesKey falla o falla descifrado.
+void handleDataPacket(uint16_t src, uint16_t msgId, bool viaLoRa, const uint8_t* blob, size_t len) {
+  if (src == identity.getId()) return;  // eco propio — ignorar
+  const Contact *c = contacts.find(src);
+  if (c == nullptr) {
+    // Contacto borrado o nunca emparejado: rechazar
+    sendNack(src, msgId, viaLoRa);
+    DLOGF("[DIAG] NACK: contacto desconocido src=%s\n", hex16(src).c_str());
+    return;
+  }
+  if (!c->hasKey || !e2eReady) {
+    sendNack(src, msgId, viaLoRa);
+    DLOGF("[DIAG] NACK: sin clave E2E src=%s\n", hex16(src).c_str());
+    return;
+  }
+  uint8_t aesKey[32];
+  if (!e2e.deriveAesKey(myPriv, c->pubKey, aesKey)) {
+    sendNack(src, msgId, viaLoRa);
+    DLOGF("[DIAG] NACK: deriveAesKey fallo src=%s\n", hex16(src).c_str());
+    return;
+  }
+  uint8_t clear[256];
+  int n = e2e.decrypt(aesKey, blob, len, clear, sizeof(clear));
+  if (n < 0) {
+    sendNack(src, msgId, viaLoRa);
+    DLOGF("[DIAG] NACK: fallo descifrado de %s\n", hex16(src).c_str());
+    return;
+  }
+  String text((char *)clear, n);
+  lastEvent = String(c->name.c_str()) + ": " + text;
+  notifyPhone("MSG:" + hex16(src) + ":" + text);
+  Serial.printf("MSG de %s: %s\n", c->name.c_str(), text.c_str());
+  displayStatus();
+  sendAck(src, msgId, viaLoRa);
+}
+
+// Callback MQTT (firma PubSubClient MQTT_CALLBACK_SIGNATURE).
+// Parsea [srcHi][srcLo][type][msgIdHi][msgIdLo][blob...] y delega segun tipo.
+// Corre dentro de mqttClient.loop() (contexto del loop principal) -> seguro tocar globals.
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  // parseDataHeader rechaza length<5; el puntero blob apunta al buffer de
+  // PubSubClient que es valido durante el callback. handleDataPacket consume
+  // el blob sincronicamente (descifra antes de retornar), sin guardar el puntero.
+  uint16_t src; uint8_t type; uint16_t msgId; const uint8_t* blob; size_t blobLen;
+  if (!MqttCodec::parseDataHeader(payload, length, src, type, msgId, blob, blobLen)) return;
+
+  if (type == TYPE_DATA) {
+    // Deduplicacion: si ya se proceso el mismo (src, msgId) por LoRa, descarta pero re-ACK.
+    if (!dedup.seen(src, msgId)) {
+      handleDataPacket(src, msgId, false, blob, blobLen);
+    } else {
+      DLOGF("[DIAG] duplicado MQTT descartado src=%04X msgId=%04X\n", src, msgId);
+      sendAck(src, msgId, false);  // re-ACK por MQTT: ya fue procesado, no reintentar
+    }
+  } else if (type == TYPE_ACK) {
+    int slot = inflight.find(msgId);
+    if (slot >= 0) {
+      notifyPhone("ACK:" + hex16(msgId) + ":broker");
+      inflight.release(slot);
+      DLOGF("[DIAG] ACK recibido MQTT msgId=%04X\n", msgId);
+    }
+  } else if (type == TYPE_NACK) {
+    int slot = inflight.find(msgId);
+    if (slot >= 0) {
+      notifyPhone("NACK:" + hex16(msgId));
+      inflight.release(slot);
+      DLOGF("[DIAG] NACK recibido MQTT msgId=%04X\n", msgId);
+    }
+  }
+  (void)topic;
+}
+
+// Cifra un texto para un contacto, lo envia por LoRa y registra en InflightTable.
+// El fallback MQTT ocurre automaticamente en loop() si LoRa no llega en ~3 s.
 void sendToContact(uint16_t dstId, const String &text) {
   const Contact *c = contacts.find(dstId);
   if (!c || !c->hasKey || !e2eReady) {
@@ -346,7 +587,29 @@ void sendToContact(uint16_t dstId, const String &text) {
     notifyPhone("ERR:cifrado");
     return;
   }
-  sendFrame(dstId, TYPE_DATA, out, n);
+
+  // Asignar msgId (1..65535; 0 reservado para paquetes sin tracking).
+  uint16_t msgId = ++_msgCounter;
+  if (msgId == 0) msgId = ++_msgCounter;  // evitar 0 tras overflow
+
+  // Pre-construir payload MQTT para almacenar en InflightTable (fallback).
+  uint8_t mq[5 + 300];
+  size_t mqn = MqttCodec::buildDataPayload(identity.getId(), TYPE_DATA, msgId,
+                                           out, (size_t)n, mq, sizeof(mq));
+
+  // Registrar en InflightTable antes de enviar (si la tabla esta llena, descartar).
+  int slot = inflight.add(msgId, dstId, mq, mqn, (uint32_t)millis());
+  if (slot < 0) {
+    notifyPhone("ERR:tabla_llena");
+    return;
+  }
+
+  // Enviar por LoRa con el msgId en el header.
+  sendFrame(dstId, TYPE_DATA, msgId, out, (size_t)n);
+
+  // Confirmar envio al telefono.
+  notifyPhone("SENT:" + hex16(msgId) + ":" + hex16(dstId));
+
   lastEvent = "Yo->" + String(c->name.c_str()) + ": " + text;
   displayStatus();
 }
@@ -414,6 +677,34 @@ void handleControlCommand(const String &line) {
     }
     return;
   }
+  // MSEND:<idHex>:<texto> — camino MQTT puro (sin sendFrame LoRa).
+  // Util para verificar el transporte broker en Plan 03 sin antena LoRa.
+  if (line.startsWith("MSEND:")) {
+    int colon = line.indexOf(':', 6);
+    if (colon < 0) {
+      notifyPhone("ERR:formato MSEND");
+      return;
+    }
+    if (colon > 0) {
+      uint16_t dst = (uint16_t)strtol(line.substring(6, colon).c_str(), nullptr, 16);
+      String text = line.substring(colon + 1);
+      const Contact *c = contacts.find(dst);
+      if (!c || !c->hasKey || !e2eReady) { notifyPhone("ERR:contacto desconocido"); return; }
+      uint8_t aesKey[32];
+      if (!e2e.deriveAesKey(myPriv, c->pubKey, aesKey)) { notifyPhone("ERR:clave"); return; }
+      uint8_t out[300];
+      int n = e2e.encrypt(aesKey, (const uint8_t *)text.c_str(), text.length(), out, sizeof(out));
+      if (n < 0) { notifyPhone("ERR:cifrado"); return; }
+      // msgId=0 es placeholder; la generacion de IDs se implementa en el plan 03-02.
+      uint8_t mq[5 + 300];
+      size_t mqn = MqttCodec::buildDataPayload(identity.getId(), TYPE_DATA, 0, out, (size_t)n, mq, sizeof(mq));
+      if (mqn > 0) {
+        bool ok = cloud.publishBlob(cloud.getInboxTopic(dst), mq, mqn);
+        notifyPhone(ok ? "MSENT:" + hex16(dst) : "ERR:mqtt_pub");
+      }
+    }
+    return;
+  }
   if (line == "LIST") {
     String out = "CONTACTS:";
     for (int i = 0; i < contacts.count(); i++) {
@@ -431,6 +722,39 @@ void handleControlCommand(const String &line) {
     }
     notifyPhone("ME:" + hex16(identity.getId()) + ":" +
                 String(identity.getName().c_str()));
+    displayStatus();
+    return;
+  }
+  if (line.startsWith("SETWIFI:")) {
+    // Nota: la pass queda en NVS en texto plano (aceptado - RESEARCH NVS).
+    WifiCredentials cr = parseSetWifi(std::string(line.c_str()));
+    if (cr.valid) {
+      prefs.putString("wifi_ssid", cr.ssid.c_str());
+      prefs.putString("wifi_pass", cr.pass.c_str());
+      wifiSSID = String(cr.ssid.c_str());
+      wifiPass  = String(cr.pass.c_str());
+      WiFi.mode(WIFI_STA);
+      WiFi.disconnect(false);
+      WiFi.setAutoReconnect(true);
+      WiFi.begin(wifiSSID.c_str(), wifiPass.c_str());
+      wifiConnState = WIFI_CONNECTING;
+      notifyPhone("WIFI:SET");
+      Serial.printf("[WiFi] SETWIFI ssid='%s'\n", wifiSSID.c_str());
+      displayStatus();
+    } else {
+      notifyPhone("ERR:SETWIFI invalido");
+    }
+    return;
+  }
+  if (line == "CLEARWIFI") {
+    prefs.remove("wifi_ssid");
+    prefs.remove("wifi_pass");
+    WiFi.disconnect(true);
+    wifiSSID = "";
+    wifiPass  = "";
+    wifiConnState = WIFI_NO_CREDS;
+    notifyPhone("WIFI:sin_cred");
+    Serial.println("[WiFi] CLEARWIFI: credenciales borradas.");
     displayStatus();
     return;
   }
@@ -481,6 +805,7 @@ void handleControlCommand(const String &line) {
                     contacts.count(), pairing.inPairingMode());
       notifyPhone("ME:" + hex16(identity.getId()) + ":" +
                   String(identity.getName().c_str()));
+      notifyPhone("WIFI:" + wifiStateStr());
       break;
     default:
       Serial.println("Comando desconocido.");
@@ -545,8 +870,12 @@ void displayStatus() {
   display.print(identity.getName().c_str());
   display.setCursor(0, 12);
   display.print("ID:"); display.print(hex16(identity.getId()));
-  display.print(" BLE:"); display.print(conn ? "1" : "-");
+  display.print(" B:"); display.print(conn ? "1" : "-");
   display.print(" C:"); display.print(contacts.count());
+  display.print(" W:");
+  if (wifiConnState == WIFI_CONNECTED)     display.print("ok");
+  else if (wifiConnState == WIFI_NO_CREDS) display.print("-");
+  else                                     display.print("x");
   display.drawLine(0, 22, 128, 22, SSD1306_WHITE);
 
   display.setCursor(0, 28);
