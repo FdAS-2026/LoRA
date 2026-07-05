@@ -35,6 +35,11 @@ jobs:
       - name: Instalar PlatformIO
         run: pip install --upgrade platformio
 
+      # secrets.h esta gitignored (credenciales). Para compilar en CI se usa la
+      # plantilla con placeholders.
+      - name: Preparar secrets.h desde la plantilla
+        run: cp src/secrets.example.h src/secrets.h
+
       - name: Tests unitarios nativos
         run: pio test -e native
 
