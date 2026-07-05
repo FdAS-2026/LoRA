@@ -141,7 +141,8 @@ bool E2ECrypto::deriveAesKey(const uint8_t myPriv[32], const uint8_t theirPub[32
 }
 
 int E2ECrypto::encrypt(const uint8_t aesKey[32], const uint8_t *pt, size_t len,
-                       uint8_t *out, size_t outCap) {
+                       uint8_t *out, size_t outCap,
+                       const uint8_t *aad, size_t aadLen) {
   if (!_ready || outCap < len + 28) return -1;
   uint8_t *nonce = out;            // 12 bytes
   uint8_t *ct = out + 12;          // len bytes
@@ -153,7 +154,7 @@ int E2ECrypto::encrypt(const uint8_t aesKey[32], const uint8_t *pt, size_t len,
   int rc = -1;
   if (mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, aesKey, 256) == 0 &&
       mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, len, nonce, 12,
-                                nullptr, 0, pt, ct, 16, tag) == 0) {
+                                aad, aadLen, pt, ct, 16, tag) == 0) {
     rc = (int)(len + 28);
   }
   mbedtls_gcm_free(&gcm);
@@ -161,7 +162,8 @@ int E2ECrypto::encrypt(const uint8_t aesKey[32], const uint8_t *pt, size_t len,
 }
 
 int E2ECrypto::decrypt(const uint8_t aesKey[32], const uint8_t *in, size_t len,
-                       uint8_t *out, size_t outCap) {
+                       uint8_t *out, size_t outCap,
+                       const uint8_t *aad, size_t aadLen) {
   if (len < 28) return -1;
   size_t ctLen = len - 28;
   if (outCap < ctLen) return -1;
@@ -173,7 +175,7 @@ int E2ECrypto::decrypt(const uint8_t aesKey[32], const uint8_t *in, size_t len,
   mbedtls_gcm_init(&gcm);
   int rc = -1;
   if (mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, aesKey, 256) == 0 &&
-      mbedtls_gcm_auth_decrypt(&gcm, ctLen, nonce, 12, nullptr, 0, tag, 16,
+      mbedtls_gcm_auth_decrypt(&gcm, ctLen, nonce, 12, aad, aadLen, tag, 16,
                                ct, out) == 0) {
     rc = (int)ctLen;
   }

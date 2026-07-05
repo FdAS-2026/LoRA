@@ -21,7 +21,14 @@ private:
   bool isConfigured;
   unsigned long lastReconnectAttempt;
 
+  // Fix DNS stall: la IP del broker se resuelve UNA vez (fuera del path
+  // bloqueante de mqttClient.connect) y se cachea. _dnsResolved indica si
+  // _brokerIp es valida; mientras sea false no se intenta el connect TLS.
+  IPAddress _brokerIp;
+  bool _dnsResolved;
+
   void reconnect();
+  bool ensureDns();
 
 public:
   CloudManager();

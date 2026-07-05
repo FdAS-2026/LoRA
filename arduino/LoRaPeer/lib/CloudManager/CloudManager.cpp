@@ -40,6 +40,7 @@ emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 CloudManager::CloudManager() : mqttClient(secureClient) {
   isConfigured = false;
   lastReconnectAttempt = 0;
+  _dnsResolved = false;
   _nodeId = 0;
   _mqttServer = "ea2b2d4f22754a798415f56a0516657b.s1.eu.hivemq.cloud";
   _mqttPort = 8883;
@@ -79,16 +80,39 @@ void CloudManager::begin() {
   secureClient.setHandshakeTimeout(10);  // TLS handshake: 10 s (en segundos)
 
   secureClient.setCACert(BROKER_ROOT_CA);
-  mqttClient.setServer(_mqttServer.c_str(), _mqttPort);
+  // El servidor MQTT se fija por IP en ensureDns() tras resolver el hostname,
+  // para sacar la resolucion DNS del path bloqueante de mqttClient.connect().
+}
+
+// Resuelve el hostname del broker a IP una sola vez y fija el servidor MQTT por
+// IP. WiFi.hostByName esta acotado por el timeout del resolver lwip (no queda
+// colgado indefinidamente). Devuelve true si _brokerIp es valida y usable.
+// Al separar el DNS del connect TLS, un fallo de DNS ya no arrastra el stall
+// de 2-5 s del handshake: se reintenta barato en el proximo ciclo.
+bool CloudManager::ensureDns() {
+  if (_dnsResolved) return true;
+  IPAddress ip;
+  if (WiFi.hostByName(_mqttServer.c_str(), ip) == 1 && ip != IPAddress(0, 0, 0, 0)) {
+    _brokerIp = ip;
+    _dnsResolved = true;
+    mqttClient.setServer(_brokerIp, _mqttPort);
+    Serial.println("[MQTT] DNS resuelto: " + _brokerIp.toString());
+    return true;
+  }
+  Serial.println("[MQTT] DNS del broker no resuelto - reintento en 5 s");
+  return false;
 }
 
 void CloudManager::reconnect() {
   if (WiFi.status() != WL_CONNECTED) {
+    _dnsResolved = false;  // al reconectar WiFi puede cambiar la red/DNS
     return; // No intentar MQTT si no hay WiFi
   }
 
   if (millis() - lastReconnectAttempt > 5000) {
     lastReconnectAttempt = millis();
+    // Resolver DNS antes del connect TLS; si falla, no bloquear con el handshake.
+    if (!ensureDns()) return;
     Serial.print("Intentando conexion MQTT a HiveMQ... ");
 
     if (mqttClient.connect(_clientId.c_str(), _mqttUser.c_str(), _mqttPass.c_str())) {

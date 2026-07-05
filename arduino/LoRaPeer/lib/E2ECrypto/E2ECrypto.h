@@ -28,11 +28,16 @@ public:
                     uint8_t aesKey[32]);
 
   // Cifra. out = nonce(12)||ct||tag(16). Devuelve longitud o -1. outCap >= len+28.
+  // aad opcional: datos adicionales autenticados por GCM (no cifrados), p. ej. el
+  // contador del ratchet que viaja en claro en el header del blob.
   int encrypt(const uint8_t aesKey[32], const uint8_t *pt, size_t len,
-              uint8_t *out, size_t outCap);
+              uint8_t *out, size_t outCap,
+              const uint8_t *aad = nullptr, size_t aadLen = 0);
   // Descifra un paquete nonce||ct||tag. Devuelve longitud del texto o -1.
+  // El aad debe coincidir con el usado al cifrar o la verificacion GCM falla.
   int decrypt(const uint8_t aesKey[32], const uint8_t *in, size_t len,
-              uint8_t *out, size_t outCap);
+              uint8_t *out, size_t outCap,
+              const uint8_t *aad = nullptr, size_t aadLen = 0);
 
 private:
   mbedtls_entropy_context _entropy;

@@ -25,6 +25,11 @@
 #include "MqttCodec.h"
 #include "InflightTable.h"
 #include "DedupRing.h"
+#include "AuthGate.h"
+#include "SasCode.h"
+#include "Ratchet.h"
+#include "MessageRouter.h"
+#include <mbedtls/md.h>
 #include "secrets.h"
 
 // Mensajeria E2E sobre LoRa, sin internet (tipo WhatsApp offline):
@@ -83,6 +88,19 @@ String pairingPin = "";
 String lastEvent = "";
 bool claimed = false;  // un telefono ya se vinculo como dueno
 
+// -------------------- UX-02: bateria + gestion de OLED
+// TTGO LoRa32: la bateria suele leerse en GPIO35 con un divisor 2:1. AJUSTAR
+// BATT_ADC_PIN/BATT_DIVIDER segun la placa real antes de la prueba de hardware.
+static const int BATT_ADC_PIN = 35;
+static const float BATT_DIVIDER = 2.0f;
+static int batteryPct = -1;                 // -1 = desconocido / sin lectura
+static unsigned long lastBattRead = 0;
+static const unsigned long BATT_READ_MS = 30000;
+// Apagado de OLED por inactividad.
+static unsigned long lastActivityMs = 0;
+static bool oledOn = true;
+static const unsigned long OLED_TIMEOUT_MS = 60000;
+
 // -------------------- WiFi STA (no bloqueante, sin CloudManager)
 enum WifiConnState { WIFI_NO_CREDS, WIFI_CONNECTING, WIFI_CONNECTED, WIFI_NO_NET };
 static WifiConnState wifiConnState = WIFI_NO_CREDS;
@@ -98,15 +116,224 @@ static const unsigned long WIFI_POLL_MS = 2000;
   #define DLOGF(...)
 #endif
 
+// Borra material sensible (claves AES derivadas, texto claro) de la pila.
+// Usa un puntero volatile para que el compilador no elimine el memset como
+// "dead store" cuando el buffer no se vuelve a leer.
+static void secureZero(void *p, size_t n) {
+  volatile uint8_t *v = (volatile uint8_t *)p;
+  while (n--) *v++ = 0;
+}
+
+// -------------------- Cripto para autenticacion del canal (SEC-01/SEC-02)
+// HMAC-SHA256 y SHA-256 crudos via la interfaz MD de mbedtls (estable entre
+// versiones 2.x/3.x). Alimentan a AuthGate (token) y SasCode (SAS).
+static std::string hmacSha256Raw(const std::string &key, const std::string &msg) {
+  unsigned char out[32];
+  const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (!info) return std::string();
+  if (mbedtls_md_hmac(info, (const unsigned char *)key.data(), key.size(),
+                      (const unsigned char *)msg.data(), msg.size(), out) != 0)
+    return std::string();
+  return std::string((char *)out, 32);
+}
+static std::string sha256Raw(const std::string &msg) {
+  unsigned char out[32];
+  const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (!info) return std::string();
+  if (mbedtls_md(info, (const unsigned char *)msg.data(), msg.size(), out) != 0)
+    return std::string();
+  return std::string((char *)out, 32);
+}
+
+// SEC-01: gate de autenticacion del canal de control BLE (token de sesion).
+static AuthGate authGate(hmacSha256Raw);
+// Secreto de claim de 16 bytes (TOFU): se genera en el primer claim y se guarda
+// en NVS; el telefono dueno lo conoce y con el responde el desafio.
+static std::string claimSecret;
+
+// SEC-02: pairing pendiente de confirmacion SAS. El contacto NO se guarda hasta
+// que el usuario confirma que el codigo SAS coincide (PAIROK).
+struct PendingPair {
+  bool active = false;
+  uint16_t src = 0;
+  uint8_t pub[32];
+  std::string name;
+  std::string sas;
+};
+static PendingPair pendingPair;
+static String sasDisplay = "";  // codigo SAS en pantalla ("" = no mostrar)
+
+// Convierte bytes crudos a hex minuscula (para exponer el claimSecret al dueno).
+static String toHexStr(const std::string &raw) {
+  static const char *H = "0123456789abcdef";
+  String out;
+  for (unsigned char b : raw) { out += H[(b >> 4) & 0xF]; out += H[b & 0xF]; }
+  return out;
+}
+
+// -------------------- Ratchet simetrico por contacto (CRY-01/02)
+static String hex16(uint16_t v);  // definido en HELPERS; usado por las claves NVS
+// Estado persistido por contacto en NVS: cadenas de envio/recepcion + contadores.
+// El blob E2E pasa a llevar el contador en claro: [ctr(4 BE)][nonce][ct][tag],
+// con el contador como AAD del GCM (autenticado). Da forward secrecy por-mensaje
+// (comprometer una clave de mensaje no revela otras) y anti-replay (contador
+// monotonico + ventana). NOTA: sobre claves X25519 estaticas NO protege contra
+// robo de la privada de largo plazo (CK0 siempre recomputable desde NVS).
+struct RatchetState {
+  uint32_t sendCtr;
+  uint32_t recvCtr;
+  uint8_t sendCK[32];
+  uint8_t recvCK[32];
+};
+static const uint32_t RATCHET_MAX_SKIP = 256;  // limita el avance por paquete (anti-DoS)
+static Ratchet::HmacFn ratchetHmac = hmacSha256Raw;
+// Codigos de retorno de ratchetDecrypt.
+static const int RD_ERR = -1, RD_REPLAY = -2, RD_DECRYPT = -3;
+
+static String ratchetKeyName(uint16_t id) { return "rk" + hex16(id); }
+
+// Inicializa el estado desde la raiz ECDH (CK0), separando direcciones por el
+// orden canonico de las pubkeys.
+static bool ratchetInit(const Contact *c, RatchetState &st) {
+  uint8_t ck0[32];
+  if (!e2e.deriveAesKey(myPriv, c->pubKey, ck0)) return false;
+  std::string ck0s((char *)ck0, 32);
+  secureZero(ck0, sizeof(ck0));
+  std::string myPubStr((char *)myPub, 32);
+  std::string theirPubStr((char *)c->pubKey, 32);
+  int dir = Ratchet::sendDir(myPubStr, theirPubStr);
+  std::string sck = Ratchet::chainRoot(ck0s, dir, ratchetHmac);
+  std::string rck = Ratchet::chainRoot(ck0s, 1 - dir, ratchetHmac);
+  secureZero(&ck0s[0], ck0s.size());
+  if (sck.size() != 32 || rck.size() != 32) return false;
+  memcpy(st.sendCK, sck.data(), 32);
+  memcpy(st.recvCK, rck.data(), 32);
+  st.sendCtr = 0;
+  st.recvCtr = 0;
+  return true;
+}
+
+static bool ratchetLoad(uint16_t id, RatchetState &st) {
+  String k = ratchetKeyName(id);
+  if (prefs.getBytesLength(k.c_str()) == sizeof(RatchetState)) {
+    prefs.getBytes(k.c_str(), &st, sizeof(RatchetState));
+    return true;
+  }
+  const Contact *c = contacts.find(id);
+  if (!c || !c->hasKey) return false;
+  if (!ratchetInit(c, st)) return false;
+  prefs.putBytes(k.c_str(), &st, sizeof(RatchetState));
+  return true;
+}
+
+static void ratchetSave(uint16_t id, const RatchetState &st) {
+  String k = ratchetKeyName(id);
+  prefs.putBytes(k.c_str(), &st, sizeof(RatchetState));
+}
+
+// Al re-emparejar o borrar un contacto, su estado de ratchet queda invalido.
+static void ratchetReset(uint16_t id) { prefs.remove(ratchetKeyName(id).c_str()); }
+
+// Cifra `pt` para dst con la clave de mensaje del ratchet de envio.
+// out = [ctr(4 BE)][nonce(12)][ct][tag(16)]. Devuelve longitud del blob o -1.
+static int ratchetEncrypt(uint16_t dst, const uint8_t *pt, size_t len,
+                          uint8_t *out, size_t outCap) {
+  if (outCap < 4 + len + 28) return -1;
+  RatchetState st;
+  if (!ratchetLoad(dst, st)) return -1;
+  std::string sck((char *)st.sendCK, 32);
+  std::string ckOut;
+  std::string mk =
+      Ratchet::deriveMessageKey(sck, st.sendCtr, st.sendCtr, ratchetHmac, ckOut);
+  secureZero(&sck[0], sck.size());
+  if (mk.size() != 32) return -1;
+  uint32_t ctr = st.sendCtr;
+  out[0] = (uint8_t)(ctr >> 24); out[1] = (uint8_t)(ctr >> 16);
+  out[2] = (uint8_t)(ctr >> 8);  out[3] = (uint8_t)ctr;
+  int n = e2e.encrypt((const uint8_t *)mk.data(), pt, len, out + 4, outCap - 4,
+                      out, 4);
+  secureZero(&mk[0], mk.size());
+  if (n < 0) { secureZero(&ckOut[0], ckOut.size()); return -1; }
+  memcpy(st.sendCK, ckOut.data(), 32);
+  secureZero(&ckOut[0], ckOut.size());
+  st.sendCtr = ctr + 1;
+  ratchetSave(dst, st);
+  return 4 + n;
+}
+
+// Descifra un blob [ctr(4)][nonce][ct][tag] de src. Devuelve el largo del texto
+// o RD_REPLAY / RD_DECRYPT / RD_ERR. Solo avanza el ratchet si el descifrado ok.
+static int ratchetDecrypt(uint16_t src, const uint8_t *blob, size_t len,
+                          uint8_t *out, size_t outCap) {
+  if (len < 4 + 28) return RD_ERR;
+  uint32_t ctr = ((uint32_t)blob[0] << 24) | ((uint32_t)blob[1] << 16) |
+                 ((uint32_t)blob[2] << 8) | blob[3];
+  RatchetState st;
+  if (!ratchetLoad(src, st)) return RD_ERR;
+  if (ctr < st.recvCtr) return RD_REPLAY;                     // ya consumido
+  if (ctr - st.recvCtr > RATCHET_MAX_SKIP) return RD_ERR;     // salto absurdo
+  std::string rck((char *)st.recvCK, 32);
+  std::string ckOut;
+  std::string mk =
+      Ratchet::deriveMessageKey(rck, st.recvCtr, ctr, ratchetHmac, ckOut);
+  secureZero(&rck[0], rck.size());
+  if (mk.size() != 32) { secureZero(&ckOut[0], ckOut.size()); return RD_ERR; }
+  int n = e2e.decrypt((const uint8_t *)mk.data(), blob + 4, len - 4, out, outCap,
+                      blob, 4);
+  secureZero(&mk[0], mk.size());
+  if (n < 0) { secureZero(&ckOut[0], ckOut.size()); return RD_DECRYPT; }
+  memcpy(st.recvCK, ckOut.data(), 32);
+  secureZero(&ckOut[0], ckOut.size());
+  st.recvCtr = ctr + 1;
+  ratchetSave(src, st);
+  return n;
+}
+
+// -------------------- MAC de ACK/NACK (CRY-03)
+// Un MAC de 4 bytes sobre (senderId, msgId, type) con una clave derivada del
+// secreto compartido con el peer impide forjar ACK/NACK. El `type` en el MAC
+// evita intercambiar un ACK por un NACK.
+static bool ackMac(uint16_t peerId, uint16_t senderId, uint16_t msgId,
+                   uint8_t type, uint8_t out[4]) {
+  const Contact *c = contacts.find(peerId);
+  if (!c || !c->hasKey) return false;
+  uint8_t ck0[32];
+  if (!e2e.deriveAesKey(myPriv, c->pubKey, ck0)) return false;
+  std::string ck0s((char *)ck0, 32);
+  secureZero(ck0, sizeof(ck0));
+  std::string ackKey = ratchetHmac(ck0s, "ack");
+  secureZero(&ck0s[0], ck0s.size());
+  if (ackKey.size() < 32) return false;
+  uint8_t msg[5] = {(uint8_t)(senderId >> 8), (uint8_t)senderId,
+                    (uint8_t)(msgId >> 8), (uint8_t)msgId, type};
+  std::string mac = ratchetHmac(ackKey, std::string((char *)msg, 5));
+  secureZero(&ackKey[0], ackKey.size());
+  if (mac.size() < 4) return false;
+  memcpy(out, mac.data(), 4);
+  return true;
+}
+
+// Verifica (constant-time) un MAC recibido de ACK/NACK. senderId = quien lo
+// mando (el peer). Sin MAC valido -> false (se ignora el ACK/NACK).
+static bool ackMacValid(uint16_t peerId, uint16_t senderId, uint16_t msgId,
+                        uint8_t type, const uint8_t *got, size_t gotLen) {
+  if (gotLen < 4) return false;
+  uint8_t exp[4];
+  if (!ackMac(peerId, senderId, msgId, type, exp)) return false;
+  uint8_t d = 0;
+  for (int i = 0; i < 4; i++) d |= (uint8_t)(exp[i] ^ got[i]);
+  return d == 0;
+}
+
 // ==================== FORWARD DECLARATIONS ====================
 void displayStatus();
 void displayPasskey(uint32_t passkey);
 void displayPairing();
 void notifyPhone(const String &s);
-void sendFrame(uint16_t dst, uint8_t type, uint16_t msgId, const uint8_t *payload, size_t len);
+bool sendFrame(uint16_t dst, uint8_t type, uint16_t msgId, const uint8_t *payload, size_t len);
 void sendPairPacket(uint8_t type, uint16_t dst);
 void handleControlCommand(const String &line);
-void sendToContact(uint16_t dstId, const String &text);
+void sendToContact(uint16_t dstId, const String &text, const String &cid = "");
 void saveContacts();
 void loadContacts();
 String wifiStateStr();
@@ -115,6 +342,9 @@ void sendAck(uint16_t dst, uint16_t msgId, bool viaLoRa);
 void sendNack(uint16_t dst, uint16_t msgId, bool viaLoRa);
 void handleDataPacket(uint16_t src, uint16_t msgId, bool viaLoRa, const uint8_t* blob, size_t len);
 void onMqttMessage(char* topic, byte* payload, unsigned int length);
+void noteActivity();       // UX-02: marca actividad y despierta el OLED
+void updateBattery();      // UX-02: lee la bateria y notifica cambios
+void oledSleepCheck();     // UX-02: apaga el OLED tras inactividad
 
 // ==================== HELPERS ====================
 static String hex16(uint16_t v) {
@@ -161,23 +391,76 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *) {
     BLE_clients_connected++;
     DLOGF("[DIAG] BLE onConnect\n");
+    noteActivity();  // UX-02
     displayStatus();
   }
   void onDisconnect(BLEServer *s) {
     if (BLE_clients_connected > 0) BLE_clients_connected--;
+    // SEC-01: al cerrarse la conexion, invalidar la sesion autenticada para que
+    // la proxima conexion tenga que repetir el desafio.
+    authGate.reset();
     s->getAdvertising()->start();
     displayStatus();
   }
 };
 
+// SEC-01: todo comando que llega por BLE pasa por este gate antes de ejecutarse.
+// - Placa sin dueno (TOFU): solo se acepta CLAIM, que genera el claimSecret y lo
+//   entrega UNA vez al telefono. El resto se rechaza.
+// - Placa con dueno: el telefono pide NONCE, responde AUTH:<hmac> y recibe un
+//   token; cada comando siguiente va como "<token>|<comando>". Sin token valido
+//   -> ERR:auth. (El canal Serial fisico NO pasa por aca: acceso fisico = dueno.)
 class ControlCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *c) {
     String v = c->getValue().c_str();
     v.trim();
-    if (v.length() > 0) {
-      DLOGF("[DIAG] CTRL: %s\n", v.c_str());
-      handleControlCommand(v);
+    if (v.length() == 0) return;
+    std::string s(v.c_str());
+    DLOGF("[DIAG] CTRL(ble): %s\n", s.c_str());
+
+    // ---- Bootstrap TOFU: placa sin dueno ----
+    if (!claimed) {
+      if (s == "CLAIM" || s == "WHOAMI") {
+        // Generar claimSecret de 16 bytes y persistirlo.
+        uint8_t sec[16];
+        esp_fill_random(sec, sizeof(sec));
+        claimSecret.assign((char *)sec, sizeof(sec));
+        secureZero(sec, sizeof(sec));
+        prefs.putBytes("claimsec", claimSecret.data(), claimSecret.size());
+        claimed = true;
+        prefs.putBool("claimed", true);
+        // Entregar el secreto al dueno UNA vez (TOFU) + identidad.
+        notifyPhone("CLAIMED:" + toHexStr(claimSecret) + ":" +
+                    hex16(identity.getId()) + ":" +
+                    String(identity.getName().c_str()));
+        displayStatus();
+      } else {
+        notifyPhone("ERR:unclaimed");
+      }
+      return;
     }
+
+    // ---- Handshake de sesion (exento de token) ----
+    if (s == "NONCE") {
+      std::string nonce = AuthGate::makeNonce(esp_random());
+      authGate.beginChallenge(nonce);
+      notifyPhone("NONCE:" + String(nonce.c_str()));
+      return;
+    }
+    if (s.rfind("AUTH:", 0) == 0) {
+      std::string tok = authGate.verifyResponse(claimSecret, s.substr(5));
+      notifyPhone(tok.empty() ? String("ERR:auth")
+                              : ("OK:" + String(tok.c_str())));
+      return;
+    }
+
+    // ---- Comando autenticado: requiere "<token>|<cmd>" ----
+    std::string payload;
+    if (!authGate.checkCommand(s, payload)) {
+      notifyPhone("ERR:auth");
+      return;
+    }
+    handleControlCommand(String(payload.c_str()));
   }
 };
 
@@ -241,6 +524,19 @@ void setup() {
 
   loadContacts();
   claimed = prefs.getBool("claimed", false);
+  // REL-02: sembrar el contador de msgId con un valor aleatorio para que tras un
+  // reinicio no colisione con lo que el receptor tiene en su DedupRing (que
+  // descartaria un mensaje nuevo como duplicado).
+  _msgCounter = (uint16_t)esp_random();
+  // SEC-01: recuperar el claimSecret persistido (si la placa ya tiene dueno).
+  {
+    size_t sl = prefs.getBytesLength("claimsec");
+    if (sl > 0) {
+      std::string buf(sl, '\0');
+      prefs.getBytes("claimsec", &buf[0], sl);
+      claimSecret = buf;
+    }
+  }
 
   Serial.printf("Identidad: %s id=%s contactos=%d\n",
                 identity.getName().c_str(), hex16(identity.getId()).c_str(),
@@ -293,6 +589,7 @@ void setup() {
   cloud.begin();
 
   Serial.println(e2eReady ? "E2ECrypto listo." : "E2ECrypto FALLO.");
+  lastActivityMs = millis();  // UX-02: arrancar el timeout de OLED desde el boot
   displayStatus();
   Serial.printf("[MEM] Free heap: %u bytes\n", ESP.getFreeHeap());
 }
@@ -337,13 +634,44 @@ void loop() {
         PairAction act = pairing.onPairPacket(type, pairId, src,
                                               identity.getId(), known);
         if (act != PAIR_NONE) {
-          contacts.addOrUpdate(src, theirName, theirPub);
-          saveContacts();
+          // El ACK de transporte se envia siempre (completa el intercambio de
+          // claves en ambos lados). El GUARDADO del contacto se difiere hasta
+          // la confirmacion SAS (SEC-02).
           if (act == PAIR_SEND_ACK) sendPairPacket(TYPE_PAIR_ACK, src);
-          lastEvent = "Pair: " + String(theirName.c_str());
-          notifyPhone("PAIRED:" + hex16(src) + ":" + String(theirName.c_str()));
-          Serial.printf("Emparejado con %s (%s)\n", theirName.c_str(),
-                        hex16(src).c_str());
+          if (known) {
+            // Contacto ya confirmado antes: re-ACK idempotente, sin repetir SAS.
+            DLOGF("[DIAG] pair re-ACK a contacto conocido src=%s\n",
+                  hex16(src).c_str());
+          } else {
+            // SEC-02: derivar el codigo SAS de (secreto compartido, ambas pubs)
+            // y esperar PAIROK/PAIRNO del usuario. No se guarda el contacto aun.
+            uint8_t aesKey[32];
+            if (e2e.deriveAesKey(myPriv, theirPub, aesKey)) {
+              std::string shared((char *)aesKey, 32);
+              secureZero(aesKey, sizeof(aesKey));
+              std::string myPubStr((char *)myPub, 32);
+              std::string theirPubStr((char *)theirPub, 32);
+              std::string sas =
+                  SasCode::sas6(shared, myPubStr, theirPubStr, sha256Raw);
+              std::string fp = SasCode::fingerprint(theirPubStr, sha256Raw);
+              secureZero(&shared[0], shared.size());
+
+              pendingPair.active = true;
+              pendingPair.src = src;
+              memcpy(pendingPair.pub, theirPub, 32);
+              pendingPair.name = theirName;
+              pendingPair.sas = sas;
+              sasDisplay = String(sas.c_str());
+              lastEvent = "SAS " + String(sas.c_str());
+              notifyPhone("SASPENDING:" + hex16(src) + ":" +
+                          String(sas.c_str()) + ":" + String(fp.c_str()) + ":" +
+                          String(theirName.c_str()));
+              Serial.printf("Pairing con %s (%s): comparar SAS %s\n",
+                            theirName.c_str(), hex16(src).c_str(), sas.c_str());
+            } else {
+              notifyPhone("ERR:sas");
+            }
+          }
           displayStatus();
         }
       }
@@ -357,18 +685,29 @@ void loop() {
         sendAck(src, msgId, true);  // re-ACK: ya fue procesado, no reintentar
       }
     } else if (type == TYPE_ACK && forMe) {
-      int slot = inflight.find(msgId);
-      if (slot >= 0) {
-        notifyPhone("ACK:" + hex16(msgId) + ":lora");
-        inflight.release(slot);
-        DLOGF("[DIAG] ACK recibido LoRa msgId=%04X\n", msgId);
+      // CRY-03: solo aceptar ACK con MAC valido del contacto src.
+      if (!ackMacValid(src, src, msgId, TYPE_ACK, payload.data(), payload.size())) {
+        DLOGF("[DIAG] ACK LoRa con MAC invalido src=%s msgId=%04X (ignorado)\n",
+              hex16(src).c_str(), msgId);
+      } else {
+        int slot = inflight.find(msgId);
+        if (slot >= 0) {
+          notifyPhone("ACK:" + hex16(msgId) + ":lora");
+          inflight.release(slot);
+          DLOGF("[DIAG] ACK recibido LoRa msgId=%04X\n", msgId);
+        }
       }
     } else if (type == TYPE_NACK && forMe) {
-      int slot = inflight.find(msgId);
-      if (slot >= 0) {
-        notifyPhone("NACK:" + hex16(msgId));
-        inflight.release(slot);
-        DLOGF("[DIAG] NACK recibido LoRa msgId=%04X\n", msgId);
+      if (!ackMacValid(src, src, msgId, TYPE_NACK, payload.data(), payload.size())) {
+        DLOGF("[DIAG] NACK LoRa con MAC invalido src=%s msgId=%04X (ignorado)\n",
+              hex16(src).c_str(), msgId);
+      } else {
+        int slot = inflight.find(msgId);
+        if (slot >= 0) {
+          notifyPhone("NACK:" + hex16(msgId));
+          inflight.release(slot);
+          DLOGF("[DIAG] NACK recibido LoRa msgId=%04X\n", msgId);
+        }
       }
     }
     (void)bcast; (void)rssi;
@@ -426,12 +765,23 @@ void loop() {
 
   wifiPoll();
   cloud.loop();  // reconexion MQTT con guard millis() 5s interno
+  updateBattery();    // UX-02: lectura periodica de bateria (guard 30s interno)
+  oledSleepCheck();   // UX-02: apagar OLED tras inactividad
   delay(10);
 }
 
 // ==================== ENVIO LoRa ====================
 // Header 7B: [dst(2)][src(2)][type(1)][msgId(2)]. msgId=0 para paquetes sin tracking.
-void sendFrame(uint16_t dst, uint8_t type, uint16_t msgId, const uint8_t *payload, size_t len) {
+// REL-01: el header es de 7 B y el FIFO del SX127x admite 255 B por trama. Si el
+// payload no entra, NO se transmite (evita truncado silencioso / corrupcion del
+// FIFO); el llamador puede caer a MQTT que si soporta el tamano. Devuelve false
+// si no se envio por tamano.
+bool sendFrame(uint16_t dst, uint8_t type, uint16_t msgId, const uint8_t *payload, size_t len) {
+  if (7 + len > 255) {
+    DLOGF("[DIAG] sendFrame: payload %u B excede el FIFO LoRa (max 248) - no enviado\n",
+          (unsigned)len);
+    return false;
+  }
   LoRa.beginPacket();
   LoRa.write((dst >> 8) & 0xFF);
   LoRa.write(dst & 0xFF);
@@ -442,6 +792,7 @@ void sendFrame(uint16_t dst, uint8_t type, uint16_t msgId, const uint8_t *payloa
   LoRa.write(msgId & 0xFF);
   if (payload && len) LoRa.write(payload, len);
   LoRa.endPacket();
+  return true;
 }
 
 // PAIR_REQ/ACK: comparte pairId + clave publica + nombre.
@@ -462,15 +813,20 @@ void sendPairPacket(uint8_t type, uint16_t dst) {
 // Payload vacio; msgId en header identifica el mensaje confirmado.
 // Si el medio original no esta disponible, usa el otro como fallback.
 void sendAck(uint16_t dst, uint16_t msgId, bool viaLoRa) {
+  // CRY-03: adjuntar MAC(4) sobre (miId, msgId, TYPE_ACK). Si no hay clave con
+  // el peer, se manda sin MAC (el receptor lo rechazara, pero es un caso raro).
+  uint8_t mac[4];
+  bool hasMac = ackMac(dst, identity.getId(), msgId, TYPE_ACK, mac);
+  const uint8_t *pl = hasMac ? mac : nullptr;
+  size_t plLen = hasMac ? 4 : 0;
   if (viaLoRa) {
-    sendFrame(dst, TYPE_ACK, msgId, nullptr, 0);
+    sendFrame(dst, TYPE_ACK, msgId, pl, plLen);
   } else if (cloud.isConnected()) {
-    uint8_t buf[5];
-    size_t n = MqttCodec::buildDataPayload(identity.getId(), TYPE_ACK, msgId, nullptr, 0, buf, sizeof(buf));
+    uint8_t buf[5 + 4];
+    size_t n = MqttCodec::buildDataPayload(identity.getId(), TYPE_ACK, msgId, pl, plLen, buf, sizeof(buf));
     cloud.publishBlob(cloud.getInboxTopic(dst), buf, n);
   } else {
-    // MQTT no disponible: usar LoRa como fallback para el ACK
-    sendFrame(dst, TYPE_ACK, msgId, nullptr, 0);
+    sendFrame(dst, TYPE_ACK, msgId, pl, plLen);
   }
 }
 
@@ -479,15 +835,19 @@ void sendAck(uint16_t dst, uint16_t msgId, bool viaLoRa) {
 // o fallo de descifrado). Payload vacio; msgId en header identifica el mensaje.
 // Si el medio original no esta disponible, usa el otro como fallback.
 void sendNack(uint16_t dst, uint16_t msgId, bool viaLoRa) {
+  // CRY-03: MAC(4) sobre (miId, msgId, TYPE_NACK).
+  uint8_t mac[4];
+  bool hasMac = ackMac(dst, identity.getId(), msgId, TYPE_NACK, mac);
+  const uint8_t *pl = hasMac ? mac : nullptr;
+  size_t plLen = hasMac ? 4 : 0;
   if (viaLoRa) {
-    sendFrame(dst, TYPE_NACK, msgId, nullptr, 0);
+    sendFrame(dst, TYPE_NACK, msgId, pl, plLen);
   } else if (cloud.isConnected()) {
-    uint8_t buf[5];
-    size_t n = MqttCodec::buildDataPayload(identity.getId(), TYPE_NACK, msgId, nullptr, 0, buf, sizeof(buf));
+    uint8_t buf[5 + 4];
+    size_t n = MqttCodec::buildDataPayload(identity.getId(), TYPE_NACK, msgId, pl, plLen, buf, sizeof(buf));
     cloud.publishBlob(cloud.getInboxTopic(dst), buf, n);
   } else {
-    // MQTT no disponible: usar LoRa como fallback para el NACK
-    sendFrame(dst, TYPE_NACK, msgId, nullptr, 0);
+    sendFrame(dst, TYPE_NACK, msgId, pl, plLen);
   }
 }
 
@@ -497,36 +857,54 @@ void sendNack(uint16_t dst, uint16_t msgId, bool viaLoRa) {
 // por el mismo medio por el que llego (viaLoRa=true → LoRa; false → MQTT).
 // NACK si: contacto desconocido, sin clave, deriveAesKey falla o falla descifrado.
 void handleDataPacket(uint16_t src, uint16_t msgId, bool viaLoRa, const uint8_t* blob, size_t len) {
-  if (src == identity.getId()) return;  // eco propio — ignorar
-  const Contact *c = contacts.find(src);
-  if (c == nullptr) {
-    // Contacto borrado o nunca emparejado: rechazar
-    sendNack(src, msgId, viaLoRa);
-    DLOGF("[DIAG] NACK: contacto desconocido src=%s\n", hex16(src).c_str());
-    return;
-  }
-  if (!c->hasKey || !e2eReady) {
-    sendNack(src, msgId, viaLoRa);
-    DLOGF("[DIAG] NACK: sin clave E2E src=%s\n", hex16(src).c_str());
-    return;
-  }
-  uint8_t aesKey[32];
-  if (!e2e.deriveAesKey(myPriv, c->pubKey, aesKey)) {
-    sendNack(src, msgId, viaLoRa);
-    DLOGF("[DIAG] NACK: deriveAesKey fallo src=%s\n", hex16(src).c_str());
-    return;
-  }
+  // La DECISION de ruteo (self/unknown/nokey/deliver/replay/undecryptable) vive
+  // en la funcion pura MessageRouter::routeIncoming, testeable nativa (QUAL-01).
+  // Aca solo se calculan los hechos y se ejecuta la accion elegida.
+  bool isSelf = (src == identity.getId());
+  const Contact *c = isSelf ? nullptr : contacts.find(src);
+  bool known = (c != nullptr);
+  bool keyReady = known && c->hasKey && e2eReady;
+
   uint8_t clear[256];
-  int n = e2e.decrypt(aesKey, blob, len, clear, sizeof(clear));
-  if (n < 0) {
-    sendNack(src, msgId, viaLoRa);
-    DLOGF("[DIAG] NACK: fallo descifrado de %s\n", hex16(src).c_str());
-    return;
+  int rc = -999;  // centinela: descifrado no intentado
+  if (!isSelf && known && keyReady) {
+    rc = ratchetDecrypt(src, blob, len, clear, sizeof(clear));
   }
-  String text((char *)clear, n);
+
+  switch (MessageRouter::routeIncoming(isSelf, known, keyReady, rc)) {
+    case MessageRouter::DROP_SELF:
+      return;
+    case MessageRouter::NACK_UNKNOWN:
+      sendNack(src, msgId, viaLoRa);
+      DLOGF("[DIAG] NACK: contacto desconocido src=%s\n", hex16(src).c_str());
+      return;
+    case MessageRouter::NACK_NOKEY:
+      sendNack(src, msgId, viaLoRa);
+      DLOGF("[DIAG] NACK: sin clave E2E src=%s\n", hex16(src).c_str());
+      return;
+    case MessageRouter::DROP_REPLAY:
+      // Contador ya consumido: replay o reordenamiento viejo. Silencioso.
+      secureZero(clear, sizeof(clear));
+      DLOGF("[DIAG] replay descartado src=%s\n", hex16(src).c_str());
+      return;
+    case MessageRouter::NACK_UNDECRYPTABLE:
+      secureZero(clear, sizeof(clear));
+      sendNack(src, msgId, viaLoRa);
+      DLOGF("[DIAG] NACK: fallo descifrado/formato de %s (rc=%d)\n",
+            hex16(src).c_str(), rc);
+      return;
+    case MessageRouter::DELIVER:
+      break;  // sigue abajo
+  }
+
+  noteActivity();  // UX-02: mensaje entrante = actividad (despierta OLED)
+  String text((char *)clear, rc);
+  // clear[] ya se copio a 'text'; borrar el buffer de pila con el texto plano.
+  secureZero(clear, sizeof(clear));
   lastEvent = String(c->name.c_str()) + ": " + text;
   notifyPhone("MSG:" + hex16(src) + ":" + text);
-  Serial.printf("MSG de %s: %s\n", c->name.c_str(), text.c_str());
+  // El texto plano por Serial solo en build de diagnostico (acceso fisico).
+  DLOGF("MSG de %s: %s\n", c->name.c_str(), text.c_str());
   displayStatus();
   sendAck(src, msgId, viaLoRa);
 }
@@ -550,18 +928,27 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
       sendAck(src, msgId, false);  // re-ACK por MQTT: ya fue procesado, no reintentar
     }
   } else if (type == TYPE_ACK) {
-    int slot = inflight.find(msgId);
-    if (slot >= 0) {
-      notifyPhone("ACK:" + hex16(msgId) + ":broker");
-      inflight.release(slot);
-      DLOGF("[DIAG] ACK recibido MQTT msgId=%04X\n", msgId);
+    // CRY-03: verificar MAC del ACK (el peer que lo manda es src).
+    if (!ackMacValid(src, src, msgId, TYPE_ACK, blob, blobLen)) {
+      DLOGF("[DIAG] ACK MQTT con MAC invalido src=%04X msgId=%04X (ignorado)\n", src, msgId);
+    } else {
+      int slot = inflight.find(msgId);
+      if (slot >= 0) {
+        notifyPhone("ACK:" + hex16(msgId) + ":broker");
+        inflight.release(slot);
+        DLOGF("[DIAG] ACK recibido MQTT msgId=%04X\n", msgId);
+      }
     }
   } else if (type == TYPE_NACK) {
-    int slot = inflight.find(msgId);
-    if (slot >= 0) {
-      notifyPhone("NACK:" + hex16(msgId));
-      inflight.release(slot);
-      DLOGF("[DIAG] NACK recibido MQTT msgId=%04X\n", msgId);
+    if (!ackMacValid(src, src, msgId, TYPE_NACK, blob, blobLen)) {
+      DLOGF("[DIAG] NACK MQTT con MAC invalido src=%04X msgId=%04X (ignorado)\n", src, msgId);
+    } else {
+      int slot = inflight.find(msgId);
+      if (slot >= 0) {
+        notifyPhone("NACK:" + hex16(msgId));
+        inflight.release(slot);
+        DLOGF("[DIAG] NACK recibido MQTT msgId=%04X\n", msgId);
+      }
     }
   }
   (void)topic;
@@ -569,20 +956,17 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
 
 // Cifra un texto para un contacto, lo envia por LoRa y registra en InflightTable.
 // El fallback MQTT ocurre automaticamente en loop() si LoRa no llega en ~3 s.
-void sendToContact(uint16_t dstId, const String &text) {
+void sendToContact(uint16_t dstId, const String &text, const String &cid) {
   const Contact *c = contacts.find(dstId);
   if (!c || !c->hasKey || !e2eReady) {
     notifyPhone("ERR:contacto desconocido");
     return;
   }
-  uint8_t aesKey[32];
-  if (!e2e.deriveAesKey(myPriv, c->pubKey, aesKey)) {
-    notifyPhone("ERR:clave");
-    return;
-  }
-  uint8_t out[300];
-  int n = e2e.encrypt(aesKey, (const uint8_t *)text.c_str(), text.length(), out,
-                      sizeof(out));
+  // Cifrado con el ratchet: out = [ctr(4)][nonce][ct][tag]. El estado de envio
+  // avanza y se persiste en NVS.
+  uint8_t out[305];
+  int n = ratchetEncrypt(dstId, (const uint8_t *)text.c_str(), text.length(),
+                         out, sizeof(out));
   if (n < 0) {
     notifyPhone("ERR:cifrado");
     return;
@@ -593,7 +977,7 @@ void sendToContact(uint16_t dstId, const String &text) {
   if (msgId == 0) msgId = ++_msgCounter;  // evitar 0 tras overflow
 
   // Pre-construir payload MQTT para almacenar en InflightTable (fallback).
-  uint8_t mq[5 + 300];
+  uint8_t mq[5 + 305];
   size_t mqn = MqttCodec::buildDataPayload(identity.getId(), TYPE_DATA, msgId,
                                            out, (size_t)n, mq, sizeof(mq));
 
@@ -607,8 +991,13 @@ void sendToContact(uint16_t dstId, const String &text) {
   // Enviar por LoRa con el msgId en el header.
   sendFrame(dstId, TYPE_DATA, msgId, out, (size_t)n);
 
-  // Confirmar envio al telefono.
-  notifyPhone("SENT:" + hex16(msgId) + ":" + hex16(dstId));
+  // Confirmar envio al telefono. Se incluye el cid de correlacion (si vino) para
+  // que la app asigne el msgId a la parte exacta sin forward-scan (fix WR-02).
+  if (cid.length() > 0) {
+    notifyPhone("SENT:" + hex16(msgId) + ":" + hex16(dstId) + ":" + cid);
+  } else {
+    notifyPhone("SENT:" + hex16(msgId) + ":" + hex16(dstId));
+  }
 
   lastEvent = "Yo->" + String(c->name.c_str()) + ": " + text;
   displayStatus();
@@ -657,6 +1046,7 @@ void loadContacts() {
 
 // ==================== COMANDOS ====================
 void handleControlCommand(const String &line) {
+  noteActivity();  // UX-02: cualquier comando cuenta como actividad (despierta OLED)
   // Comandos con argumentos propios (no en ControlCommand): SETNAME, SEND, LIST.
   if (line.startsWith("SETNAME:")) {
     String nm = line.substring(8);
@@ -670,10 +1060,19 @@ void handleControlCommand(const String &line) {
     return;
   }
   if (line.startsWith("SEND:")) {
-    int colon = line.indexOf(':', 5);
-    if (colon > 0) {
-      uint16_t dst = (uint16_t)strtol(line.substring(5, colon).c_str(), nullptr, 16);
-      sendToContact(dst, line.substring(colon + 1));
+    // Formato: SEND:<dstHex>:<cid>:<texto>. El <cid> es un id de correlacion del
+    // cliente que se devuelve en SENT para que la app asocie cada chunk a su
+    // burbuja sin ambiguedad (fix WR-02). Formato viejo SEND:<dstHex>:<texto>
+    // (sin cid, p. ej. por serial) sigue soportado con cid vacio.
+    int c1 = line.indexOf(':', 5);
+    if (c1 > 0) {
+      uint16_t dst = (uint16_t)strtol(line.substring(5, c1).c_str(), nullptr, 16);
+      int c2 = line.indexOf(':', c1 + 1);
+      if (c2 > 0) {
+        sendToContact(dst, line.substring(c2 + 1), line.substring(c1 + 1, c2));
+      } else {
+        sendToContact(dst, line.substring(c1 + 1), "");
+      }
     }
     return;
   }
@@ -690,13 +1089,12 @@ void handleControlCommand(const String &line) {
       String text = line.substring(colon + 1);
       const Contact *c = contacts.find(dst);
       if (!c || !c->hasKey || !e2eReady) { notifyPhone("ERR:contacto desconocido"); return; }
-      uint8_t aesKey[32];
-      if (!e2e.deriveAesKey(myPriv, c->pubKey, aesKey)) { notifyPhone("ERR:clave"); return; }
-      uint8_t out[300];
-      int n = e2e.encrypt(aesKey, (const uint8_t *)text.c_str(), text.length(), out, sizeof(out));
+      // Camino de test: cifra con el ratchet (mismo formato que sendToContact).
+      uint8_t out[305];
+      int n = ratchetEncrypt(dst, (const uint8_t *)text.c_str(), text.length(), out, sizeof(out));
       if (n < 0) { notifyPhone("ERR:cifrado"); return; }
       // msgId=0 es placeholder; la generacion de IDs se implementa en el plan 03-02.
-      uint8_t mq[5 + 300];
+      uint8_t mq[5 + 305];
       size_t mqn = MqttCodec::buildDataPayload(identity.getId(), TYPE_DATA, 0, out, (size_t)n, mq, sizeof(mq));
       if (mqn > 0) {
         bool ok = cloud.publishBlob(cloud.getInboxTopic(dst), mq, mqn);
@@ -706,13 +1104,17 @@ void handleControlCommand(const String &line) {
     return;
   }
   if (line == "LIST") {
-    String out = "CONTACTS:";
+    // REL-03: una notificacion por contacto (cada linea entra sobrado en el MTU)
+    // en vez de un unico CONTACTS: largo que se truncaria. La app acumula los
+    // CONTACT: y confirma con ENDCONTACTS.
+    notifyPhone("CONTACTS_BEGIN");
     for (int i = 0; i < contacts.count(); i++) {
       const Contact &c = contacts.get(i);
-      out += hex16(c.id) + "=" + String(c.name.c_str());
-      if (i < contacts.count() - 1) out += ",";
+      delay(15);  // espaciar los notify para que la pila BLE no descarte ninguno
+      notifyPhone("CONTACT:" + hex16(c.id) + "=" + String(c.name.c_str()));
     }
-    notifyPhone(out);
+    delay(15);
+    notifyPhone("CONTACTS_END");
     return;
   }
   if (line == "WHOAMI") {
@@ -759,6 +1161,40 @@ void handleControlCommand(const String &line) {
     return;
   }
 
+  // SEC-02: confirmacion del SAS. PAIROK guarda el contacto pendiente; PAIRNO
+  // lo descarta. Sin un pairing pendiente, ambos son no-ops seguros.
+  if (line == "PAIROK") {
+    if (pendingPair.active) {
+      contacts.addOrUpdate(pendingPair.src, pendingPair.name, pendingPair.pub);
+      saveContacts();
+      // Contacto nuevo (o re-emparejado): arrancar su ratchet desde cero.
+      ratchetReset(pendingPair.src);
+      notifyPhone("PAIRED:" + hex16(pendingPair.src) + ":" +
+                  String(pendingPair.name.c_str()));
+      Serial.printf("Emparejado con %s (%s) tras confirmar SAS\n",
+                    pendingPair.name.c_str(), hex16(pendingPair.src).c_str());
+      lastEvent = "Pair: " + String(pendingPair.name.c_str());
+    } else {
+      notifyPhone("ERR:sin_pairing");
+    }
+    pendingPair.active = false;
+    sasDisplay = "";
+    pairing.cancelPairing();
+    displayStatus();
+    return;
+  }
+  if (line == "PAIRNO") {
+    if (pendingPair.active) {
+      notifyPhone("PAIRABORT:" + hex16(pendingPair.src));
+      Serial.println("Pairing abortado por SAS no coincidente.");
+    }
+    pendingPair.active = false;
+    sasDisplay = "";
+    pairing.cancelPairing();
+    displayStatus();
+    return;
+  }
+
   Command cmd = parseControlCommand(std::string(line.c_str()));
   switch (cmd.type) {
     case CMD_PAIR:
@@ -775,6 +1211,7 @@ void handleControlCommand(const String &line) {
         uint16_t id = (uint16_t)strtol(cmd.arg.c_str(), nullptr, 16);
         contacts.remove(id);
         saveContacts();
+        ratchetReset(id);  // descartar el estado de ratchet del contacto
         notifyPhone("UNPAIRED:" + hex16(id));
       }
       pairing.cancelPairing();
@@ -794,6 +1231,12 @@ void handleControlCommand(const String &line) {
       }
       claimed = false;
       prefs.putBool("claimed", false);
+      // SEC-01: al soltar el dueno, invalidar el claimSecret y la sesion para
+      // que un nuevo telefono pueda reclamar la placa de cero (TOFU).
+      prefs.remove("claimsec");
+      if (!claimSecret.empty()) secureZero(&claimSecret[0], claimSecret.size());
+      claimSecret.clear();
+      authGate.reset();
       lastEvent = "";  // ya no hay dueño: limpiar pantalla
       Serial.println("Bonds BLE borrados.");
       displayStatus();
@@ -806,6 +1249,7 @@ void handleControlCommand(const String &line) {
       notifyPhone("ME:" + hex16(identity.getId()) + ":" +
                   String(identity.getName().c_str()));
       notifyPhone("WIFI:" + wifiStateStr());
+      if (batteryPct >= 0) notifyPhone("BATT:" + String(batteryPct));  // UX-02
       break;
     default:
       Serial.println("Comando desconocido.");
@@ -856,9 +1300,65 @@ void displayPairing() {
   display.display();
 }
 
+// UX-02: registra actividad (comando, mensaje, conexion) y despierta el OLED si
+// estaba apagado por inactividad.
+void noteActivity() {
+  lastActivityMs = millis();
+  if (!oledOn && displayReady) {
+    display.ssd1306_command(SSD1306_DISPLAYON);
+    oledOn = true;
+    displayStatus();
+  }
+}
+
+// UX-02: lee la bateria periodicamente y notifica al telefono si cambia el %.
+// Defensiva: si la lectura es implausible (pin sin divisor) deja batteryPct=-1.
+void updateBattery() {
+  unsigned long now = millis();
+  if (now - lastBattRead < BATT_READ_MS && lastBattRead != 0) return;
+  lastBattRead = now;
+  uint32_t mv = analogReadMilliVolts(BATT_ADC_PIN);  // mV en el pin del ADC
+  if (mv < 100) { batteryPct = -1; return; }         // sin bateria/divisor
+  float vbat = (mv / 1000.0f) * BATT_DIVIDER;
+  int pct = (int)((vbat - 3.3f) / (4.2f - 3.3f) * 100.0f);
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  if (pct != batteryPct) {
+    batteryPct = pct;
+    notifyPhone("BATT:" + String(pct));
+    displayStatus();
+  }
+}
+
+// UX-02: apaga el OLED si paso el timeout de inactividad (ahorro + anti burn-in).
+void oledSleepCheck() {
+  if (oledOn && displayReady && lastActivityMs != 0 &&
+      millis() - lastActivityMs > OLED_TIMEOUT_MS) {
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+    oledOn = false;
+  }
+}
+
 void displayStatus() {
   if (!displayReady) return;
   if (showingPasskey) return;
+  // SEC-02: mientras haya un SAS pendiente de confirmar, mostrarlo grande para
+  // que el usuario lo compare con la otra placa.
+  if (sasDisplay.length() > 0) {
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("Compara el codigo");
+    display.println("en ambas placas:");
+    display.setTextSize(2);
+    display.setCursor(10, 28);
+    display.println(sasDisplay);
+    display.setTextSize(1);
+    display.setCursor(0, 54);
+    display.print("=> confirmar en app");
+    display.display();
+    return;
+  }
   if (pairing.inPairingMode()) { displayPairing(); return; }
 
   bool conn = BLE_clients_connected > 0;
@@ -868,6 +1368,12 @@ void displayStatus() {
   display.setCursor(0, 0);
   // Nombre propio + id
   display.print(identity.getName().c_str());
+  // UX-02: bateria arriba a la derecha (si hay lectura valida).
+  if (batteryPct >= 0) {
+    String bs = String(batteryPct) + "%";
+    display.setCursor(128 - bs.length() * 6, 0);
+    display.print(bs);
+  }
   display.setCursor(0, 12);
   display.print("ID:"); display.print(hex16(identity.getId()));
   display.print(" B:"); display.print(conn ? "1" : "-");
