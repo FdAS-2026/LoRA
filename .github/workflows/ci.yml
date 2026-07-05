@@ -1,0 +1,42 @@
+name: CI
+
+# Gate verde del firmware: corre en cada push a dev/main y en PRs a main.
+# Debe pasar antes de mergear a main.
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  firmware:
+    name: Tests nativos + build ESP32
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: arduino/LoRaPeer
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Cachear PlatformIO (core + plataformas ESP32 + libdeps) para acelerar.
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            arduino/LoRaPeer/.pio
+          key: pio-${{ runner.os }}-${{ hashFiles('arduino/LoRaPeer/platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-
+
+      - name: Instalar PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Tests unitarios nativos
+        run: pio test -e native
+
+      - name: Compilar firmware (esp32dev)
+        run: pio run -e esp32dev
